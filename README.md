@@ -147,6 +147,7 @@ You can adjust the start and goal positions, as well as the collision radius in 
 
 ## 🙏  Acknowledgements
 We adapted some codes from some awesome repositories including [superquadric_parsing](https://github.com/paschalidoud/superquadric_parsing), [CuboidAbstractionViaSeg](https://github.com/SilenKZYoung/CuboidAbstractionViaSeg), [volumentations](https://github.com/kumuji/volumentations), [LION](https://github.com/nv-tlabs/LION), [occupancy_networks](https://github.com/autonomousvision/occupancy_networks), and [convolutional_occupancy_networks](https://github.com/autonomousvision/convolutional_occupancy_networks). Thanks for making codes and data public available.
+We also gratefully acknowledge NVIDIA for their academic compute grant, which enabled the development of this project.
 
 ## 🤝 Contributing
 
