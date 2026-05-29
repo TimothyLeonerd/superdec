@@ -59,6 +59,15 @@ shapenet:
   categories: null #['03001627'] 
   normalize: False
 
+sqzero_lmdb:
+  path: /hnvme/workspace/v123be13-WS/data/SQ_Zero/1k_naive
+  train_split: train.txt
+  val_split: test.txt
+  n_points: 4096
+  normalize: true
+  normal_mode: radial
+  load_sidecars: false
+
 trainer:
   save_path: checkpoints
   save_every_n_epochs: 50

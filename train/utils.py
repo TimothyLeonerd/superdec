@@ -4,6 +4,7 @@ import os
 from torch.utils.data import DataLoader
 from superdec.superdec import SuperDec
 from superdec.data.dataloader import ShapeNet
+from superdec.data.sqzero_lmdb import SQZeroLMDB
 from superdec.loss.loss import Loss
 from torch.optim import Adam
 import random
@@ -41,6 +42,9 @@ def build_dataloaders(cfg, is_distributed=False):
     if cfg.dataset == 'shapenet':
         train_ds = ShapeNet(split='train', cfg=cfg)
         val_ds = ShapeNet(split='val', cfg=cfg)
+    elif cfg.dataset == 'sqzero_lmdb':
+        train_ds = SQZeroLMDB(split='train', cfg=cfg)
+        val_ds = SQZeroLMDB(split='val', cfg=cfg)
     else:
         raise ValueError(f"Unsupported dataset {cfg.dataset}")
 
