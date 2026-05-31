@@ -1,7 +1,6 @@
 import io
-import os
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import lmdb
 import numpy as np
@@ -10,7 +9,11 @@ from torch.utils.data import Dataset
 
 from superdec.data.dataloader import normalize_points, get_transforms
 
+
+# Per-process LMDB environment cache.
+# Needed because train_ds and val_ds may open the same shard in the same process.
 _LMDB_ENV_CACHE = {}
+
 
 def _load_npy_from_lmdb_value(value: bytes) -> np.ndarray:
     if value is None:
@@ -24,18 +27,109 @@ def _make_radial_normals(points: np.ndarray) -> np.ndarray:
     denom = np.maximum(denom, 1e-8)
     return (centered / denom).astype(np.float32)
 
+def _euler_xyz_to_matrix_np(euler: np.ndarray) -> np.ndarray:
+    """Convert SQ-Zero xyz Euler angles to rotation matrices.
+
+    This matches:
+        scipy.spatial.transform.Rotation.from_euler("xyz", euler).as_matrix()
+
+    With column-vector convention:
+        p_world = R @ p_local + t
+
+    Your sampler uses row vectors:
+        P = P @ R.T + t
+
+    which is equivalent.
+    """
+    euler = euler.astype(np.float32, copy=False)
+
+    x = euler[:, 0]
+    y = euler[:, 1]
+    z = euler[:, 2]
+
+    cx, sx = np.cos(x), np.sin(x)
+    cy, sy = np.cos(y), np.sin(y)
+    cz, sz = np.cos(z), np.sin(z)
+
+    R = np.empty((euler.shape[0], 3, 3), dtype=np.float32)
+
+    # R = Rz @ Ry @ Rx, matching scipy Rotation.from_euler("xyz", ...)
+    R[:, 0, 0] = cy * cz
+    R[:, 0, 1] = cz * sx * sy - cx * sz
+    R[:, 0, 2] = sx * sz + cx * cz * sy
+
+    R[:, 1, 0] = cy * sz
+    R[:, 1, 1] = cx * cz + sx * sy * sz
+    R[:, 1, 2] = cx * sy * sz - cz * sx
+
+    R[:, 2, 0] = -sy
+    R[:, 2, 1] = cy * sx
+    R[:, 2, 2] = cx * cy
+
+    return R
+
+
+def _convert_sqzero_params_to_superdec_targets(
+    sq_params: np.ndarray,
+    kmax: int,
+    translation: np.ndarray,
+    scale: float,
+):
+    """Convert raw SQ-Zero [K,11] params into normalized SuperDec GT tensors.
+
+    SQ-Zero raw convention:
+        [a_x, a_y, a_z, eps_1, eps_2, euler_x, euler_y, euler_z, t_x, t_y, t_z]
+
+    SuperDec target convention:
+        gt_scale:  [Kmax, 3]
+        gt_shape:  [Kmax, 2]
+        gt_rotate: [Kmax, 3, 3]
+        gt_trans:  [Kmax, 3]
+        valid_mask:[Kmax]
+    """
+    sq_params = sq_params.astype(np.float32, copy=False)
+
+    if sq_params.ndim != 2 or sq_params.shape[1] != 11:
+        raise ValueError(f"Expected sq_params shape [K, 11], got {sq_params.shape}")
+
+    k = int(sq_params.shape[0])
+    if k > kmax:
+        raise ValueError(f"K={k} exceeds kmax={kmax}")
+
+    gt_scale = np.zeros((kmax, 3), dtype=np.float32)
+    gt_shape = np.zeros((kmax, 2), dtype=np.float32)
+    gt_rotate = np.zeros((kmax, 3, 3), dtype=np.float32)
+    gt_trans = np.zeros((kmax, 3), dtype=np.float32)
+    valid_mask = np.zeros((kmax,), dtype=np.bool_)
+
+    raw_scale = sq_params[:, 0:3]
+    raw_shape = sq_params[:, 3:5]
+    raw_euler = sq_params[:, 5:8]
+    raw_trans = sq_params[:, 8:11]
+
+    scale = np.float32(scale)
+    translation = translation.astype(np.float32, copy=False).reshape(1, 3)
+
+    gt_scale[:k] = raw_scale / scale
+    gt_shape[:k] = raw_shape
+    gt_rotate[:k] = _euler_xyz_to_matrix_np(raw_euler)
+    gt_trans[:k] = (raw_trans - translation) / scale
+    valid_mask[:k] = True
+
+    return gt_scale, gt_shape, gt_rotate, gt_trans, valid_mask, k
 
 class SQZeroLMDB(Dataset):
-    """SQ-Zero LMDB dataset adapter for the existing SuperDec trainer.
+    """SQ-Zero LMDB dataset adapter for SuperDec.
 
     Expected LMDB keys:
         <key>              -> points, [N, 3], float32
-        <key>.labels       -> primitive labels, [N], int32      optional for now
-        <key>.sq_params    -> SQ params, [K, 11], float32       optional for now
+        <key>.labels       -> primitive labels, [N], int32
+        <key>.sq_params    -> SQ params, [K, 11], float32
 
-    For original SuperDec training we only use points. Since the current SQ-Zero
-    LMDB does not store normals, we synthesize radial normals and recommend
-    setting loss.w_cub=0.0 for the first native LMDB run.
+    For original SuperDec training, only points/normals are used.
+    For supervised Hungarian training later, use:
+        load_sidecars: true
+    which additionally returns sampled labels, padded SQ params, valid_mask, and K.
     """
 
     def __init__(self, split: str, cfg):
@@ -47,6 +141,7 @@ class SQZeroLMDB(Dataset):
         self.normalize = bool(getattr(cfg.sqzero_lmdb, "normalize", True))
         self.load_sidecars = bool(getattr(cfg.sqzero_lmdb, "load_sidecars", False))
         self.normal_mode = str(getattr(cfg.sqzero_lmdb, "normal_mode", "radial"))
+        self.kmax = int(getattr(cfg.sqzero_lmdb, "kmax", 8))
 
         if split == "train":
             split_file = getattr(cfg.sqzero_lmdb, "train_split", "train.txt")
@@ -73,15 +168,24 @@ class SQZeroLMDB(Dataset):
             p for p in self.root.iterdir()
             if p.is_dir() and (p / "data.mdb").exists()
         )
+
         if len(self.shard_dirs) == 0:
             raise RuntimeError(f"No LMDB shards found under: {self.root}")
 
-        # LMDB environments are opened lazily per worker/process.
+        # Open lazily per process / worker.
         self._envs: Optional[List[lmdb.Environment]] = None
         self._key_to_shard: Dict[str, int] = {}
 
-        # Reuse SuperDec's existing augmentation function.
         self.transform = get_transforms(split, cfg)
+
+        # Important: if we return GT SQ params, random point-cloud augmentations
+        # would also need to update gt_rotate / gt_trans. That is not implemented yet.
+        if self.load_sidecars and self.transform is not None:
+            raise ValueError(
+                "SQZeroLMDB load_sidecars=true is incompatible with "
+                "trainer.augmentations=true for now, because GT SQ "
+                "rotations/translations are not updated under augmentation."
+            )
 
     def __len__(self):
         return len(self.keys)
@@ -115,7 +219,6 @@ class SQZeroLMDB(Dataset):
     def _get_value(self, key: str) -> bytes:
         self._open_envs()
 
-        # Fast path if we have already found this key before in this worker.
         shard_idx = self._key_to_shard.get(key)
         if shard_idx is not None:
             with self._envs[shard_idx].begin(write=False) as txn:
@@ -123,7 +226,6 @@ class SQZeroLMDB(Dataset):
             if value is not None:
                 return value
 
-        # Robust path: try all shards. Fine for one/few shards.
         encoded = key.encode("utf-8")
         for i, env in enumerate(self._envs):
             with env.begin(write=False) as txn:
@@ -137,23 +239,97 @@ class SQZeroLMDB(Dataset):
     def _load_array(self, key: str) -> np.ndarray:
         return _load_npy_from_lmdb_value(self._get_value(key))
 
-    def _sample_points(self, points: np.ndarray) -> np.ndarray:
-        points = points.astype(np.float32, copy=False)
-        n = points.shape[0]
+    def _sample_indices(self, n_available: int) -> np.ndarray:
+        if n_available >= self.n_points:
+            return np.random.choice(n_available, self.n_points, replace=False)
+        return np.random.choice(n_available, self.n_points, replace=True)
 
-        if n >= self.n_points:
-            idx = np.random.choice(n, self.n_points, replace=False)
-        else:
-            idx = np.random.choice(n, self.n_points, replace=True)
+    def _pad_sq_params(self, sq_params: np.ndarray) -> Tuple[np.ndarray, np.ndarray, int]:
+        sq_params = sq_params.astype(np.float32, copy=False)
 
-        return points[idx].astype(np.float32, copy=False)
+        if sq_params.ndim != 2 or sq_params.shape[1] != 11:
+            raise ValueError(f"Expected sq_params shape [K, 11], got {sq_params.shape}")
+
+        k = int(sq_params.shape[0])
+
+        if k > self.kmax:
+            raise ValueError(
+                f"Sample has K={k} primitives, but dataset kmax={self.kmax}. "
+                f"Increase sqzero_lmdb.kmax."
+            )
+
+        padded = np.zeros((self.kmax, sq_params.shape[1]), dtype=np.float32)
+        valid_mask = np.zeros((self.kmax,), dtype=np.bool_)
+
+        padded[:k] = sq_params
+        valid_mask[:k] = True
+
+        return padded, valid_mask, k
 
     def __getitem__(self, idx):
         key = self.keys[idx]
 
-        points = self._load_array(key)
-        points = self._sample_points(points)
+        raw_points = self._load_array(key).astype(np.float32, copy=False)
 
+        if raw_points.ndim != 2 or raw_points.shape[1] != 3:
+            raise ValueError(
+                f"Expected points shape [N, 3], got {raw_points.shape} for key={key}"
+            )
+
+        # Sample point indices once, then use the same indices for labels.
+        sample_idx = self._sample_indices(raw_points.shape[0])
+        points = raw_points[sample_idx].astype(np.float32, copy=False)
+
+        labels = None
+        sq_params_padded = None
+        raw_valid_mask = None
+        raw_k = None
+
+        gt_scale = None
+        gt_shape = None
+        gt_rotate = None
+        gt_trans = None
+        valid_mask = None
+        k = None
+
+        if self.load_sidecars:
+            raw_labels = self._load_array(f"{key}.labels").astype(np.int64, copy=False)
+            raw_sq_params = self._load_array(f"{key}.sq_params").astype(np.float32, copy=False)
+
+            if raw_labels.ndim != 1:
+                raise ValueError(
+                    f"Expected labels shape [N], got {raw_labels.shape} for key={key}"
+                )
+
+            if raw_labels.shape[0] != raw_points.shape[0]:
+                raise ValueError(
+                    f"labels length {raw_labels.shape[0]} does not match "
+                    f"points length {raw_points.shape[0]} for key={key}"
+                )
+
+            labels = raw_labels[sample_idx].astype(np.int64, copy=False)
+
+            sq_params_padded, raw_valid_mask, raw_k = self._pad_sq_params(raw_sq_params)
+
+            if labels.min() < 0:
+                raise ValueError(f"Negative labels found for key={key}: min={labels.min()}")
+
+            if labels.max() >= raw_k:
+                raise ValueError(
+                    f"Label max {labels.max()} >= K={raw_k} for key={key}. "
+                    f"Labels and sq_params are inconsistent."
+                )
+
+        # Normalize points using SuperDec's own convention.
+        #
+        # normalize_points returns:
+        #   points_norm = (points_raw - translation) / scale
+        #
+        # Therefore GT SQ parameters must be transformed into the same frame:
+        #   gt_scale = raw_scale / scale
+        #   gt_trans = (raw_trans - translation) / scale
+        #   gt_rotate = raw_rotate
+        #   gt_shape = raw_shape
         if self.normalize:
             points, translation, scale = normalize_points(points)
         else:
@@ -161,6 +337,24 @@ class SQZeroLMDB(Dataset):
             scale = np.float32(1.0)
 
         points = points.astype(np.float32, copy=False)
+
+        if self.load_sidecars:
+            gt_scale, gt_shape, gt_rotate, gt_trans, valid_mask, k = (
+                _convert_sqzero_params_to_superdec_targets(
+                    raw_sq_params,
+                    kmax=self.kmax,
+                    translation=np.asarray(translation, dtype=np.float32),
+                    scale=float(scale),
+                )
+            )
+
+            if k != raw_k:
+                raise RuntimeError(
+                    f"Internal K mismatch for key={key}: converted K={k}, raw K={raw_k}"
+                )
+
+            if not np.array_equal(valid_mask, raw_valid_mask):
+                raise RuntimeError(f"Internal valid_mask mismatch for key={key}")
 
         if self.normal_mode == "radial":
             normals = _make_radial_normals(points)
@@ -184,12 +378,22 @@ class SQZeroLMDB(Dataset):
         }
 
         if self.load_sidecars:
-            # Not used by original SuperDec. Useful later for supervised Hungarian.
-            labels_key = f"{key}.labels"
-            params_key = f"{key}.sq_params"
+            item["labels"] = torch.from_numpy(labels)
+            item["part_ids"] = torch.from_numpy(labels)
 
-            item["labels"] = torch.from_numpy(self._load_array(labels_key).astype(np.int64))
-            item["sq_params"] = torch.from_numpy(self._load_array(params_key).astype(np.float32))
+            # Raw padded SQ-Zero parameters:
+            # [a_x, a_y, a_z, eps_1, eps_2, euler_x, euler_y, euler_z, t_x, t_y, t_z]
+            # Useful for debugging / traceability.
+            item["sq_params"] = torch.from_numpy(sq_params_padded)
+
+            # SuperDec-style normalized GT parameters.
+            # These are the fields to use for future supervised losses.
+            item["gt_scale"] = torch.from_numpy(gt_scale)
+            item["gt_shape"] = torch.from_numpy(gt_shape)
+            item["gt_rotate"] = torch.from_numpy(gt_rotate)
+            item["gt_trans"] = torch.from_numpy(gt_trans)
+            item["valid_mask"] = torch.from_numpy(valid_mask)
+            item["K"] = torch.tensor(k, dtype=torch.long)
 
         return item
 

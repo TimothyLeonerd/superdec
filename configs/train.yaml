@@ -67,6 +67,7 @@ sqzero_lmdb:
   normalize: true
   normal_mode: radial
   load_sidecars: false
+  kmax: 8
 
 trainer:
   save_path: checkpoints
