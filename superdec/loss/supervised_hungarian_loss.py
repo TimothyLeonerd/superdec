@@ -2,6 +2,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from superdec.loss.loss import sampling_from_parametric_space_to_equivalent_points
+from superdec.loss.sampler import EqualDistanceSamplerSQ
+
 try:
     from scipy.optimize import linear_sum_assignment
 except ImportError as exc:
@@ -10,17 +13,27 @@ except ImportError as exc:
 
 
 class SupervisedHungarianLoss(nn.Module):
-    """First supervised DETR-style loss for SQ-Zero.
+    """Supervised DETR-style loss for SQ-Zero.
 
-    Uses only:
-      - out_dict["assign_matrix"]: [B, N, P], point-to-slot probabilities
-      - out_dict["exist"]:         [B, P, 1], slot existence probabilities
-      - batch["labels"]:           [B, N], GT primitive id per point
-      - batch["K"]:                [B], number of GT primitives
+    Current terms:
+      - existence loss
+      - assignment loss
+      - optional matched surface Chamfer loss
 
-    Matching is computed per sample with Hungarian assignment.
-    Matching itself is non-differentiable and done under no_grad, as in DETR.
-    The losses after matching are differentiable.
+    Uses:
+      out_dict["assign_matrix"]: [B, N, P]
+      out_dict["exist"]:         [B, P, 1]
+      out_dict["scale"]:         [B, P, 3]
+      out_dict["shape"]:         [B, P, 2]
+      out_dict["rotate"]:        [B, P, 3, 3]
+      out_dict["trans"]:         [B, P, 3]
+
+      batch["labels"]:           [B, N]
+      batch["K"]:                [B]
+      batch["gt_scale"]:         [B, Kmax, 3]
+      batch["gt_shape"]:         [B, Kmax, 2]
+      batch["gt_rotate"]:        [B, Kmax, 3, 3]
+      batch["gt_trans"]:         [B, Kmax, 3]
     """
 
     requires_batch = True
@@ -34,36 +47,65 @@ class SupervisedHungarianLoss(nn.Module):
                 f"Original import error: {_SCIPY_IMPORT_ERROR}"
             )
 
+        # Differentiable loss weights.
         self.w_exist = float(getattr(cfg, "w_sup_exist", 1.0))
         self.w_assign = float(getattr(cfg, "w_sup_assign", 1.0))
+        self.w_surface = float(getattr(cfg, "w_sup_surface", 0.0))
 
-        self._forward_calls = 0
-
-        # Matching-cost weights. These only affect the discrete matching step.
+        # Matching-cost weights. These affect only the discrete matching step.
         self.match_w_assign = float(getattr(cfg, "match_w_assign", 1.0))
-        self.match_w_exist = float(getattr(cfg, "match_w_exist", 0.1))
-
-        # Debug logging. If > 0, print Hungarian matches every N forward calls.
-        # For tiny-overfit with batch_size=16 and one batch per epoch,
-        # debug_match_every=10 means roughly every 10 epochs.
-        self.debug_match_every = int(getattr(cfg, "debug_match_every", 0))
-        self.debug_match_max_samples = int(getattr(cfg, "debug_match_max_samples", 4))
+        self.match_w_exist = float(getattr(cfg, "match_w_exist", 0.0))
 
         self.eps = float(getattr(cfg, "eps", 1e-8))
 
-    @torch.no_grad()
-    def _hungarian_for_one(self, assign_b, exist_b, labels_b, K_b):
-        """Compute slot-to-GT matching for one batch item.
+        # Surface-loss sampler.
+        self.surface_n_samples = int(getattr(cfg, "surface_n_samples", 128))
+        self.surface_sampler = EqualDistanceSamplerSQ(
+            n_samples=self.surface_n_samples,
+            D_eta=float(getattr(cfg, "surface_D_eta", 0.05)),
+            D_omega=float(getattr(cfg, "surface_D_omega", 0.05)),
+        )
+
+        # Debug logging.
+        self.debug_match_every = int(getattr(cfg, "debug_match_every", 0))
+        self.debug_match_max_samples = int(getattr(cfg, "debug_match_max_samples", 4))
+        self._forward_calls = 0
+
+    @staticmethod
+    def _local_to_world(local_points, rotate, trans):
+        """Transform local primitive surface points into normalized object frame.
 
         Args:
-            assign_b: [N, P]
-            exist_b:  [P]
-            labels_b: [N]
-            K_b: int
+            local_points: [B, M, S, 3]
+            rotate:       [B, M, 3, 3], local-to-world rotation
+            trans:        [B, M, 3]
 
         Returns:
-            matched_slots: [K] long tensor.
-                matched_slots[k] = predicted slot p matched to GT primitive k.
+            world_points: [B, M, S, 3]
+        """
+        return (
+            torch.einsum("bmij,bmsj->bmsi", rotate, local_points)
+            + trans.unsqueeze(2)
+        )
+
+    @staticmethod
+    def _chamfer_squared(x, y):
+        """Symmetric squared Chamfer distance.
+
+        Args:
+            x: [Sx, 3]
+            y: [Sy, 3]
+        """
+        diff = x[:, None, :] - y[None, :, :]
+        d2 = (diff ** 2).sum(dim=-1)
+        return d2.min(dim=1)[0].mean() + d2.min(dim=0)[0].mean()
+
+    @torch.no_grad()
+    def _hungarian_for_one(self, assign_b, exist_b, labels_b, K_b):
+        """Compute GT primitive -> predicted slot matching for one sample.
+
+        Returns:
+            matched_slots: [K], matched_slots[k] = predicted slot p.
         """
         N, P = assign_b.shape
         K = int(K_b)
@@ -73,23 +115,19 @@ class SupervisedHungarianLoss(nn.Module):
         if K > P:
             raise ValueError(f"K={K} cannot exceed number of predicted slots P={P}.")
 
-        # cost[p, k]
-        cost = assign_b.new_zeros((P, K))
+        cost = assign_b.new_zeros((P, K))  # cost[p, k]
 
         for k in range(K):
             mask = labels_b == k
             n_k = int(mask.sum().item())
+
             if n_k == 0:
-                # This should not happen for your current data/sampling, but make
-                # it very costly if a primitive has no sampled points.
                 cost[:, k] = 1e6
                 continue
 
-            # Low cost if slot p assigns high probability to points of GT primitive k.
             probs = assign_b[mask, :]  # [n_k, P]
             assign_cost = -torch.log(probs.clamp_min(self.eps)).mean(dim=0)  # [P]
 
-            # Low cost if slot p has high existence probability.
             exist_cost = -torch.log(exist_b.clamp_min(self.eps))  # [P]
 
             cost[:, k] = (
@@ -99,7 +137,6 @@ class SupervisedHungarianLoss(nn.Module):
 
         row_ind, col_ind = linear_sum_assignment(cost.detach().cpu().numpy())
 
-        # linear_sum_assignment returns arbitrary order. We want matched_slots[k] = p.
         matched_slots_np = np.empty((K,), dtype=np.int64)
         for p, k in zip(row_ind, col_ind):
             matched_slots_np[k] = p
@@ -110,12 +147,75 @@ class SupervisedHungarianLoss(nn.Module):
             dtype=torch.long,
         )
 
-    def forward(self, pc, normals, out_dict, batch):
-        assign = out_dict["assign_matrix"]          # [B, N, P], probabilities
-        exist = out_dict["exist"].squeeze(-1)       # [B, P], probabilities
+    def _compute_surface_loss(self, out_dict, batch, all_matched_slots):
+        """Compute matched predicted-vs-GT surface Chamfer loss.
 
-        labels = batch["labels"].to(assign.device).long()  # [B, N]
-        K = batch["K"].to(assign.device).long()            # [B]
+        Matching is already fixed by all_matched_slots.
+
+        Args:
+            all_matched_slots: list of length B.
+                all_matched_slots[b][k] = predicted slot matched to GT primitive k.
+        """
+        pred_scale = out_dict["scale"]       # [B, P, 3]
+        pred_shape = out_dict["shape"]       # [B, P, 2]
+        pred_rotate = out_dict["rotate"]     # [B, P, 3, 3]
+        pred_trans = out_dict["trans"]       # [B, P, 3]
+
+        gt_scale = batch["gt_scale"].to(pred_scale.device).float()
+        gt_shape = batch["gt_shape"].to(pred_scale.device).float()
+        gt_rotate = batch["gt_rotate"].to(pred_scale.device).float()
+        gt_trans = batch["gt_trans"].to(pred_scale.device).float()
+        K = batch["K"].to(pred_scale.device).long()
+
+        B = pred_scale.shape[0]
+
+        # Sample predicted surfaces for all predicted slots.
+        pred_local, _ = sampling_from_parametric_space_to_equivalent_points(
+            pred_scale,
+            pred_shape,
+            self.surface_sampler,
+        )
+        pred_world = self._local_to_world(pred_local, pred_rotate, pred_trans)
+
+        total = pred_scale.new_tensor(0.0)
+        n_pairs = 0
+
+        for b in range(B):
+            K_b = int(K[b].item())
+            matched_slots = all_matched_slots[b]
+
+            # Sample GT surfaces only for valid GT primitives.
+            gt_local_b, _ = sampling_from_parametric_space_to_equivalent_points(
+                gt_scale[b:b + 1, :K_b, :],
+                gt_shape[b:b + 1, :K_b, :],
+                self.surface_sampler,
+            )
+            gt_world_b = self._local_to_world(
+                gt_local_b,
+                gt_rotate[b:b + 1, :K_b, :, :],
+                gt_trans[b:b + 1, :K_b, :],
+            )[0]  # [K_b, S, 3]
+
+            for k in range(K_b):
+                p = int(matched_slots[k].item())
+
+                x_pred = pred_world[b, p]    # [S, 3]
+                x_gt = gt_world_b[k]         # [S, 3]
+
+                total = total + self._chamfer_squared(x_pred, x_gt)
+                n_pairs += 1
+
+        if n_pairs == 0:
+            return pred_scale.new_tensor(0.0)
+
+        return total / n_pairs
+
+    def forward(self, pc, normals, out_dict, batch):
+        assign = out_dict["assign_matrix"]          # [B, N, P]
+        exist = out_dict["exist"].squeeze(-1)       # [B, P]
+
+        labels = batch["labels"].to(assign.device).long()
+        K = batch["K"].to(assign.device).long()
 
         B, N, P = assign.shape
 
@@ -125,8 +225,6 @@ class SupervisedHungarianLoss(nn.Module):
             and self._forward_calls % self.debug_match_every == 0
         )
 
-        # torch.is_grad_enabled() is false during Trainer.evaluate(),
-        # because evaluate is wrapped in @torch.no_grad().
         phase = "train" if torch.is_grad_enabled() else "eval"
 
         total_exist_loss = assign.new_tensor(0.0)
@@ -141,6 +239,7 @@ class SupervisedHungarianLoss(nn.Module):
         total_exist_pos_mean = 0.0
         total_exist_neg_mean = 0.0
 
+        all_matched_slots = []
         debug_lines = []
 
         for b in range(B):
@@ -151,12 +250,13 @@ class SupervisedHungarianLoss(nn.Module):
                 exist_b=exist[b],
                 labels_b=labels[b],
                 K_b=K_b,
-            )  # [K_b], matched_slots[k] = p
+            )
+            all_matched_slots.append(matched_slots)
 
             # --------------------
             # Existence target
             # --------------------
-            exist_target = torch.zeros_like(exist[b])  # [P]
+            exist_target = torch.zeros_like(exist[b])
             exist_target[matched_slots] = 1.0
 
             exist_loss_b = nn.functional.binary_cross_entropy(
@@ -168,12 +268,10 @@ class SupervisedHungarianLoss(nn.Module):
             # --------------------
             # Assignment target
             # --------------------
-            # For each point i, GT primitive labels[b,i] = k.
-            # The target predicted slot is matched_slots[k].
             target_slot = matched_slots[labels[b]]  # [N]
 
             point_indices = torch.arange(N, device=assign.device)
-            chosen_probs = assign[b, point_indices, target_slot]  # [N]
+            chosen_probs = assign[b, point_indices, target_slot]
 
             assign_loss_b = -torch.log(chosen_probs.clamp_min(self.eps)).mean()
 
@@ -181,7 +279,7 @@ class SupervisedHungarianLoss(nn.Module):
             # Metrics
             # --------------------
             with torch.no_grad():
-                pred_slot = assign[b].argmax(dim=1)  # [N]
+                pred_slot = assign[b].argmax(dim=1)
                 assign_acc_b = (pred_slot == target_slot).float().mean().item()
 
                 pred_count_b = (exist[b] > 0.5).sum().item()
@@ -196,7 +294,6 @@ class SupervisedHungarianLoss(nn.Module):
                 neg_mean_b = neg_vals.mean().item() if neg_vals.numel() > 0 else float("nan")
 
                 if should_debug_print and b < self.debug_match_max_samples:
-                    # Show GT primitive k -> predicted slot p.
                     match_str = ", ".join(
                         f"gt{k}->slot{int(p)}"
                         for k, p in enumerate(matched_slots.detach().cpu().tolist())
@@ -220,7 +317,7 @@ class SupervisedHungarianLoss(nn.Module):
                         f"soft_count={soft_count_b:.3f} "
                         f"pred_count={int(pred_count_b)} "
                         f"assign_acc={assign_acc_b:.3f}"
-)
+                    )
 
             total_exist_loss = total_exist_loss + exist_loss_b
             total_assign_loss = total_assign_loss + assign_loss_b
@@ -240,11 +337,25 @@ class SupervisedHungarianLoss(nn.Module):
         exist_loss = total_exist_loss / B
         assign_loss = total_assign_loss / B
 
-        loss = self.w_exist * exist_loss + self.w_assign * assign_loss
+        if self.w_surface > 0.0:
+            surface_loss = self._compute_surface_loss(
+                out_dict=out_dict,
+                batch=batch,
+                all_matched_slots=all_matched_slots,
+            )
+        else:
+            surface_loss = assign.new_tensor(0.0)
+
+        loss = (
+            self.w_exist * exist_loss
+            + self.w_assign * assign_loss
+            + self.w_surface * surface_loss
+        )
 
         loss_dict = {
             "sup_exist_loss": float(exist_loss.detach().cpu().item()),
             "sup_assign_loss": float(assign_loss.detach().cpu().item()),
+            "sup_surface_loss": float(surface_loss.detach().cpu().item()),
             "sup_assign_acc": total_assign_acc / B,
             "sup_count_acc": total_count_acc / B,
             "sup_pred_count": total_pred_count / B,

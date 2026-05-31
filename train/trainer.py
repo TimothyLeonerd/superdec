@@ -24,6 +24,7 @@ class Trainer:
         self.start_epoch = start_epoch
         self.is_distributed = is_distributed
         self.train_sampler = train_sampler
+        self.grad_clip_norm = getattr(ctx, "grad_clip_norm", None)
 
 
     def save_checkpoint(self, epoch, val_loss):
@@ -110,12 +111,10 @@ class Trainer:
             self.optimizer.zero_grad()
             loss.backward()
 
-            grad_clip_norm = getattr(self.cfg.trainer, "grad_clip_norm", None)
-
-            if grad_clip_norm is not None and float(grad_clip_norm) > 0:
+            if self.grad_clip_norm is not None and float(self.grad_clip_norm) > 0:
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
-                    max_norm=float(grad_clip_norm),
+                    max_norm=float(self.grad_clip_norm),
                 )
 
             self.optimizer.step()

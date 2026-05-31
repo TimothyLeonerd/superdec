@@ -110,6 +110,11 @@ loss:
   match_w_exist: 0.1
   eps: 1.0e-8
 
+  w_sup_surface: 0.0
+  surface_n_samples: 128
+  surface_D_eta: 0.05
+  surface_D_omega: 0.05
+
   debug_match_every: 0
   debug_match_max_samples: 4
   
