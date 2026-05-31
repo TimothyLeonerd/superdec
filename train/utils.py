@@ -6,6 +6,7 @@ from superdec.superdec import SuperDec
 from superdec.data.dataloader import ShapeNet
 from superdec.data.sqzero_lmdb import SQZeroLMDB
 from superdec.loss.loss import Loss
+from superdec.loss.supervised_hungarian_loss import SupervisedHungarianLoss
 from torch.optim import Adam
 import random
 import numpy as np
@@ -67,7 +68,14 @@ def build_dataloaders(cfg, is_distributed=False):
 
 
 def build_loss(cfg):
-    return Loss(cfg.loss)
+    loss_type = getattr(cfg.loss, "type", "original")
+
+    if loss_type == "original":
+        return Loss(cfg.loss)
+    elif loss_type == "supervised_hungarian":
+        return SupervisedHungarianLoss(cfg.loss)
+    else:
+        raise ValueError(f"Unsupported loss type: {loss_type}")
 
 def set_seed(seed: int):
     random.seed(seed)

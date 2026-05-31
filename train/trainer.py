@@ -67,7 +67,10 @@ class Trainer:
         for batch in pbar:
             pc, normals = batch['points'].cuda().float(), batch['normals'].cuda().float()
             outdict = self.model(pc)
-            loss, loss_dict = self.loss_fn(pc, normals, outdict)
+            if getattr(self.loss_fn, "requires_batch", False):
+                loss, loss_dict = self.loss_fn(pc, normals, outdict, batch)
+            else:
+                loss, loss_dict = self.loss_fn(pc, normals, outdict)
 
             total_loss += loss.item()
             total_batches += 1
@@ -98,11 +101,28 @@ class Trainer:
         for batch in pbar:
             pc, normals = batch['points'].cuda().float(), batch['normals'].cuda().float()
             outdict = self.model(pc)
-            loss, loss_dict = self.loss_fn(pc, normals, outdict)
+            if getattr(self.loss_fn, "requires_batch", False):
+                loss, loss_dict = self.loss_fn(pc, normals, outdict, batch)
+            else:
+                loss, loss_dict = self.loss_fn(pc, normals, outdict)
 
             # Backward pass
             self.optimizer.zero_grad()
             loss.backward()
+
+            grad_clip_norm = getattr(self.cfg.trainer, "grad_clip_norm", None)
+
+            if grad_clip_norm is not None and float(grad_clip_norm) > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    max_norm=float(grad_clip_norm),
+                )
+
+            self.optimizer.step()
+
+            # Dbg: Investigate loss jumps
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
             self.optimizer.step()
 
             if self.scheduler is not None:

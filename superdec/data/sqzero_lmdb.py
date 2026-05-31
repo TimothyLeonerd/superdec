@@ -164,10 +164,25 @@ class SQZeroLMDB(Dataset):
         if len(self.keys) == 0:
             raise RuntimeError(f"No keys found in split file: {self.split_path}")
 
+        if split == "train":
+            max_samples = getattr(cfg.sqzero_lmdb, "max_train_samples", None)
+        elif split == "val":
+            max_samples = getattr(cfg.sqzero_lmdb, "max_val_samples", None)
+        else:
+            max_samples = None
+
+        if max_samples is not None:
+            max_samples = int(max_samples)
+            if max_samples > 0:
+                self.keys = self.keys[:max_samples]
+
         self.shard_dirs = sorted(
             p for p in self.root.iterdir()
             if p.is_dir() and (p / "data.mdb").exists()
         )
+
+        print(f"[SQZeroLMDB] split={split} split_file={self.split_path}")
+        print(f"[SQZeroLMDB] n_keys={len(self.keys)} first_keys={self.keys[:5]}")
 
         if len(self.shard_dirs) == 0:
             raise RuntimeError(f"No LMDB shards found under: {self.root}")

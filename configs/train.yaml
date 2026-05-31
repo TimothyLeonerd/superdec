@@ -21,6 +21,7 @@ superdec:
     dim_feedforward: 512 # default
     deep_supervision: False
     pos_encoding_type: sinusoidal
+    dropout: 0.1
   point_encoder:
     in_channels: 3
     out_channels: 128
@@ -68,6 +69,8 @@ sqzero_lmdb:
   normal_mode: radial
   load_sidecars: false
   kmax: 8
+  max_train_samples: null
+  max_val_samples: null
 
 trainer:
   save_path: checkpoints
@@ -77,6 +80,7 @@ trainer:
   num_workers: 4
   evaluate_every_n_epochs: 1
   augmentations: True
+  grad_clip_norm: null
 optimizer:
   lr: 4e-4 #1e-4 #1e-4   0.001
   weight_decay: 0 # default
@@ -96,6 +100,18 @@ loss:
   w_ext: 0.01 #0.01 
   w_cub: 1.0 #1.0 
   w_cd: 1.0
+
+  type: original
+
+  # Used only when loss.type=supervised_hungarian
+  w_sup_exist: 1.0
+  w_sup_assign: 1.0
+  match_w_assign: 1.0
+  match_w_exist: 0.1
+  eps: 1.0e-8
+
+  debug_match_every: 0
+  debug_match_max_samples: 4
   
 visualization:
   res_primitives: 40

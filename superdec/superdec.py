@@ -23,8 +23,15 @@ class SuperDec(nn.Module):
 
         self.point_encoder = StackedPVConv(ctx.point_encoder)
 
-        decoder_layer = DecoderLayer(d_model=self.emb_dims, nhead=self.n_heads, dim_feedforward=self.dim_feedforward, 
-                                               batch_first=True, swapped_attention=ctx.decoder.swapped_attention)
+        decoder_layer = DecoderLayer(
+            d_model=self.emb_dims,
+            nhead=self.n_heads,
+            dim_feedforward=self.dim_feedforward,
+            dropout=getattr(ctx.decoder, "dropout", 0.1),
+            batch_first=True,
+            swapped_attention=ctx.decoder.swapped_attention,
+        )
+
         self.layers = TransformerDecoder(decoder_layer=decoder_layer, n_layers=self.n_layers, 
                                          max_len=self.n_queries, pos_encoding_type=self.pos_encoding_type, 
                                          masked_attention=ctx.decoder.masked_attention)
