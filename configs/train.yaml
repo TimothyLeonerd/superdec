@@ -121,6 +121,11 @@ loss:
   part_cd_max_points_per_part: 512
 
   w_sup_surface: 0.0
+
+  # Synthetic-only helper loss for SQ-Zero:
+  # directly supervise eps_1, eps_2 after Hungarian matching.
+  # Keep 0.0 for real datasets without GT SQ parameters.
+  w_sup_shape_param: 0.0
   surface_n_samples: 128
   surface_D_eta: 0.05
   surface_D_omega: 0.05

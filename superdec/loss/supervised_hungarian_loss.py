@@ -61,6 +61,11 @@ class SupervisedHungarianLoss(nn.Module):
         self.w_assign = float(getattr(cfg, "w_sup_assign", 1.0))
         self.w_surface = float(getattr(cfg, "w_sup_surface", 0.0))
 
+        # Synthetic-only helper loss for SQ-Zero:
+        # directly supervise eps_1, eps_2 after Hungarian matching.
+        # Keep at 0.0 for real datasets without GT SQ parameters.
+        self.w_shape_param = float(getattr(cfg, "w_sup_shape_param", 0.0))
+
         # Matching-cost weights. These affect only the discrete Hungarian step.
         self.match_w_assign = float(getattr(cfg, "match_w_assign", 1.0))
         self.match_w_exist = float(getattr(cfg, "match_w_exist", 0.0))
@@ -336,6 +341,47 @@ class SupervisedHungarianLoss(nn.Module):
 
         return total / n_pairs
 
+    def _compute_shape_param_loss(self, out_dict, batch, all_matched_slots):
+        """Direct L1 supervision for SQ shape exponents eps_1, eps_2.
+
+        This is a synthetic SQ-Zero diagnostic loss. It should remain disabled
+        for real part datasets that do not have GT SQ parameters.
+
+        For matched GT primitive k and predicted slot p=sigma(k):
+
+            loss_k = mean(|pred_shape[p] - gt_shape[k]|)
+
+        where shape = [eps_1, eps_2].
+        """
+        if "gt_shape" not in batch:
+            raise KeyError(
+                "loss.w_sup_shape_param > 0 requires batch['gt_shape']. "
+                "Disable this loss for real datasets without GT SQ parameters."
+            )
+
+        pred_shape = out_dict["shape"]  # [B, P, 2]
+        gt_shape = batch["gt_shape"].to(pred_shape.device).float()
+        K = batch["K"].to(pred_shape.device).long()
+
+        total = pred_shape.new_tensor(0.0)
+        n_pairs = 0
+
+        B = pred_shape.shape[0]
+
+        for b in range(B):
+            K_b = int(K[b].item())
+            matched_slots = all_matched_slots[b]
+
+            for k in range(K_b):
+                p = int(matched_slots[k].item())
+                total = total + torch.abs(pred_shape[b, p] - gt_shape[b, k]).mean()
+                n_pairs += 1
+
+        if n_pairs == 0:
+            return pred_shape.new_tensor(0.0)
+
+        return total / n_pairs
+
     def _compute_surface_loss(self, pc, out_dict, batch, all_matched_slots):
         if self.surface_target == "gt_surface":
             return self._compute_gt_surface_loss(
@@ -490,16 +536,27 @@ class SupervisedHungarianLoss(nn.Module):
         else:
             surface_loss = assign.new_tensor(0.0)
 
+        if self.w_shape_param > 0.0:
+            shape_param_loss = self._compute_shape_param_loss(
+                out_dict=out_dict,
+                batch=batch,
+                all_matched_slots=all_matched_slots,
+            )
+        else:
+            shape_param_loss = assign.new_tensor(0.0)
+
         loss = (
             self.w_exist * exist_loss
             + self.w_assign * assign_loss
             + self.w_surface * surface_loss
+            + self.w_shape_param * shape_param_loss
         )
 
         loss_dict = {
             "sup_exist_loss": float(exist_loss.detach().cpu().item()),
             "sup_assign_loss": float(assign_loss.detach().cpu().item()),
             "sup_surface_loss": float(surface_loss.detach().cpu().item()),
+            "sup_shape_param_loss": float(shape_param_loss.detach().cpu().item()),
             "sup_assign_acc": total_assign_acc / B,
             "sup_count_acc": total_count_acc / B,
             "sup_pred_count": total_pred_count / B,
