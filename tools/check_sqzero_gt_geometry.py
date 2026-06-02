@@ -169,7 +169,7 @@ def main(cfg):
             gt_trans=gt_trans[b:b+1],
         )
         wrong_residuals.append(torch.abs(F_wrong - 1.0).reshape(-1))
-        '''
+        
 
     if wrong_residuals:
         wrong_residuals = torch.cat(wrong_residuals)

@@ -110,6 +110,16 @@ loss:
   match_w_exist: 0.1
   eps: 1.0e-8
 
+  # Supervised geometry target:
+  #   gt_surface  = predicted SQ surface vs sampled GT SQ surface
+  #   part_points = predicted SQ surface vs actual labeled input points
+  surface_target: gt_surface
+
+  # For surface_target=part_points:
+  # L = d(part_points -> pred_surface) + beta * d(pred_surface -> part_points)
+  part_cd_beta: 0.0
+  part_cd_max_points_per_part: 512
+
   w_sup_surface: 0.0
   surface_n_samples: 128
   surface_D_eta: 0.05

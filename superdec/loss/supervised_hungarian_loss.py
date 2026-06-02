@@ -13,14 +13,19 @@ except ImportError as exc:
 
 
 class SupervisedHungarianLoss(nn.Module):
-    """Supervised DETR-style loss for SQ-Zero.
+    """Supervised DETR-style loss for SQ-Zero / part-labeled point clouds.
 
-    Current terms:
-      - existence loss
-      - assignment loss
-      - optional matched surface Chamfer loss
+    Terms:
+      - supervised existence BCE
+      - supervised point-to-slot assignment NLL
+      - optional geometry loss:
+          surface_target="gt_surface":
+              predicted SQ surface <-> sampled GT SQ surface
+          surface_target="part_points":
+              actual labeled part points -> predicted SQ surface
+              plus beta * predicted SQ surface -> actual labeled part points
 
-    Uses:
+    Expected model outputs:
       out_dict["assign_matrix"]: [B, N, P]
       out_dict["exist"]:         [B, P, 1]
       out_dict["scale"]:         [B, P, 3]
@@ -28,8 +33,12 @@ class SupervisedHungarianLoss(nn.Module):
       out_dict["rotate"]:        [B, P, 3, 3]
       out_dict["trans"]:         [B, P, 3]
 
+    Expected batch fields:
+      batch["points"]:           [B, N, 3]
       batch["labels"]:           [B, N]
       batch["K"]:                [B]
+
+    Additional fields for surface_target="gt_surface":
       batch["gt_scale"]:         [B, Kmax, 3]
       batch["gt_shape"]:         [B, Kmax, 2]
       batch["gt_rotate"]:        [B, Kmax, 3, 3]
@@ -52,13 +61,29 @@ class SupervisedHungarianLoss(nn.Module):
         self.w_assign = float(getattr(cfg, "w_sup_assign", 1.0))
         self.w_surface = float(getattr(cfg, "w_sup_surface", 0.0))
 
-        # Matching-cost weights. These affect only the discrete matching step.
+        # Matching-cost weights. These affect only the discrete Hungarian step.
         self.match_w_assign = float(getattr(cfg, "match_w_assign", 1.0))
         self.match_w_exist = float(getattr(cfg, "match_w_exist", 0.0))
 
         self.eps = float(getattr(cfg, "eps", 1e-8))
 
-        # Surface-loss sampler.
+        # Geometry target.
+        self.surface_target = str(getattr(cfg, "surface_target", "gt_surface"))
+        valid_targets = {"gt_surface", "part_points"}
+        if self.surface_target not in valid_targets:
+            raise ValueError(
+                f"Unknown loss.surface_target={self.surface_target!r}. "
+                f"Expected one of {sorted(valid_targets)}."
+            )
+
+        # For part-points Chamfer:
+        # L = d(part -> pred) + beta * d(pred -> part)
+        self.part_cd_beta = float(getattr(cfg, "part_cd_beta", 0.0))
+        self.part_cd_max_points_per_part = int(
+            getattr(cfg, "part_cd_max_points_per_part", 512)
+        )
+
+        # Surface sampler.
         self.surface_n_samples = int(getattr(cfg, "surface_n_samples", 128))
         self.surface_sampler = EqualDistanceSamplerSQ(
             n_samples=self.surface_n_samples,
@@ -93,12 +118,46 @@ class SupervisedHungarianLoss(nn.Module):
         """Symmetric squared Chamfer distance.
 
         Args:
-            x: [Sx, 3]
-            y: [Sy, 3]
+            x: [Nx, 3]
+            y: [Ny, 3]
         """
-        diff = x[:, None, :] - y[None, :, :]
-        d2 = (diff ** 2).sum(dim=-1)
-        return d2.min(dim=1)[0].mean() + d2.min(dim=0)[0].mean()
+        if x.numel() == 0 or y.numel() == 0:
+            return x.new_tensor(0.0)
+
+        d2 = torch.cdist(x.unsqueeze(0), y.unsqueeze(0), p=2.0)[0] ** 2
+        return d2.min(dim=1).values.mean() + d2.min(dim=0).values.mean()
+
+    @staticmethod
+    def _directional_chamfer_squared(src, dst):
+        """One directional squared Chamfer: src -> dst.
+
+        Args:
+            src: [Ns, 3]
+            dst: [Nd, 3]
+
+        Returns:
+            mean_s min_d ||src_s - dst_d||^2
+        """
+        if src.numel() == 0 or dst.numel() == 0:
+            return src.new_tensor(0.0)
+
+        d2 = torch.cdist(src.unsqueeze(0), dst.unsqueeze(0), p=2.0)[0] ** 2
+        return d2.min(dim=1).values.mean()
+
+    def _subsample_part_points(self, points):
+        """Deterministically subsample part points for cheaper part-point Chamfer."""
+        max_points = self.part_cd_max_points_per_part
+
+        if max_points is None or max_points <= 0 or points.shape[0] <= max_points:
+            return points
+
+        idx = torch.linspace(
+            0,
+            points.shape[0] - 1,
+            steps=max_points,
+            device=points.device,
+        ).long()
+        return points[idx]
 
     @torch.no_grad()
     def _hungarian_for_one(self, assign_b, exist_b, labels_b, K_b):
@@ -107,11 +166,11 @@ class SupervisedHungarianLoss(nn.Module):
         Returns:
             matched_slots: [K], matched_slots[k] = predicted slot p.
         """
-        N, P = assign_b.shape
+        _, P = assign_b.shape
         K = int(K_b)
 
         if K < 1:
-            raise ValueError("K must be >= 1 for SQ-Zero supervised samples.")
+            raise ValueError("K must be >= 1 for supervised samples.")
         if K > P:
             raise ValueError(f"K={K} cannot exceed number of predicted slots P={P}.")
 
@@ -127,8 +186,7 @@ class SupervisedHungarianLoss(nn.Module):
 
             probs = assign_b[mask, :]  # [n_k, P]
             assign_cost = -torch.log(probs.clamp_min(self.eps)).mean(dim=0)  # [P]
-
-            exist_cost = -torch.log(exist_b.clamp_min(self.eps))  # [P]
+            exist_cost = -torch.log(exist_b.clamp_min(self.eps))             # [P]
 
             cost[:, k] = (
                 self.match_w_assign * assign_cost
@@ -147,19 +205,34 @@ class SupervisedHungarianLoss(nn.Module):
             dtype=torch.long,
         )
 
-    def _compute_surface_loss(self, out_dict, batch, all_matched_slots):
-        """Compute matched predicted-vs-GT surface Chamfer loss.
+    def _sample_predicted_surfaces(self, out_dict):
+        """Sample predicted SQ surfaces for all predicted slots.
 
-        Matching is already fixed by all_matched_slots.
-
-        Args:
-            all_matched_slots: list of length B.
-                all_matched_slots[b][k] = predicted slot matched to GT primitive k.
+        Returns:
+            pred_world: [B, P, S, 3]
         """
-        pred_scale = out_dict["scale"]       # [B, P, 3]
-        pred_shape = out_dict["shape"]       # [B, P, 2]
-        pred_rotate = out_dict["rotate"]     # [B, P, 3, 3]
-        pred_trans = out_dict["trans"]       # [B, P, 3]
+        pred_local, _ = sampling_from_parametric_space_to_equivalent_points(
+            out_dict["scale"],
+            out_dict["shape"],
+            self.surface_sampler,
+        )
+
+        pred_world = self._local_to_world(
+            pred_local,
+            out_dict["rotate"],
+            out_dict["trans"],
+        )
+
+        return pred_world
+
+    def _compute_gt_surface_loss(self, out_dict, batch, all_matched_slots):
+        """Matched predicted-vs-GT sampled SQ surface Chamfer.
+
+        This is the previous/current SQ-Zero synthetic geometry loss.
+        """
+        pred_world = self._sample_predicted_surfaces(out_dict)
+
+        pred_scale = out_dict["scale"]
 
         gt_scale = batch["gt_scale"].to(pred_scale.device).float()
         gt_shape = batch["gt_shape"].to(pred_scale.device).float()
@@ -169,14 +242,6 @@ class SupervisedHungarianLoss(nn.Module):
 
         B = pred_scale.shape[0]
 
-        # Sample predicted surfaces for all predicted slots.
-        pred_local, _ = sampling_from_parametric_space_to_equivalent_points(
-            pred_scale,
-            pred_shape,
-            self.surface_sampler,
-        )
-        pred_world = self._local_to_world(pred_local, pred_rotate, pred_trans)
-
         total = pred_scale.new_tensor(0.0)
         n_pairs = 0
 
@@ -184,12 +249,12 @@ class SupervisedHungarianLoss(nn.Module):
             K_b = int(K[b].item())
             matched_slots = all_matched_slots[b]
 
-            # Sample GT surfaces only for valid GT primitives.
             gt_local_b, _ = sampling_from_parametric_space_to_equivalent_points(
                 gt_scale[b:b + 1, :K_b, :],
                 gt_shape[b:b + 1, :K_b, :],
                 self.surface_sampler,
             )
+
             gt_world_b = self._local_to_world(
                 gt_local_b,
                 gt_rotate[b:b + 1, :K_b, :, :],
@@ -198,9 +263,8 @@ class SupervisedHungarianLoss(nn.Module):
 
             for k in range(K_b):
                 p = int(matched_slots[k].item())
-
-                x_pred = pred_world[b, p]    # [S, 3]
-                x_gt = gt_world_b[k]         # [S, 3]
+                x_pred = pred_world[b, p]  # [S, 3]
+                x_gt = gt_world_b[k]       # [S, 3]
 
                 total = total + self._chamfer_squared(x_pred, x_gt)
                 n_pairs += 1
@@ -210,6 +274,86 @@ class SupervisedHungarianLoss(nn.Module):
 
         return total / n_pairs
 
+    def _compute_part_point_surface_loss(self, pc, batch, out_dict, all_matched_slots):
+        """Matched predicted SQ surface to actual labeled part points.
+
+        For each GT part k, with matched predicted slot p:
+
+            L_k = d(part_points_k -> pred_surface_p)
+                  + beta * d(pred_surface_p -> part_points_k)
+
+        beta=0.0 is intentionally very asymmetric and means:
+            every observed part point should be near the predicted SQ,
+            but extra/unobserved predicted SQ surface is not penalized.
+
+        This target is more compatible with real part-labeled datasets than
+        sampled GT SQ surfaces.
+        """
+        pred_world = self._sample_predicted_surfaces(out_dict)
+
+        labels = batch["labels"].to(pc.device).long()
+        K = batch["K"].to(pc.device).long()
+
+        B = pc.shape[0]
+
+        total = pc.new_tensor(0.0)
+        n_pairs = 0
+
+        for b in range(B):
+            K_b = int(K[b].item())
+            matched_slots = all_matched_slots[b]
+
+            for k in range(K_b):
+                part_mask = labels[b] == k
+                if int(part_mask.sum().item()) == 0:
+                    continue
+
+                part_points = pc[b, part_mask, :]  # [Nk, 3]
+                part_points = self._subsample_part_points(part_points)
+
+                p = int(matched_slots[k].item())
+                pred_points = pred_world[b, p]     # [S, 3]
+
+                part_to_pred = self._directional_chamfer_squared(
+                    src=part_points,
+                    dst=pred_points,
+                )
+
+                if self.part_cd_beta > 0.0:
+                    pred_to_part = self._directional_chamfer_squared(
+                        src=pred_points,
+                        dst=part_points,
+                    )
+                    loss_k = part_to_pred + self.part_cd_beta * pred_to_part
+                else:
+                    loss_k = part_to_pred
+
+                total = total + loss_k
+                n_pairs += 1
+
+        if n_pairs == 0:
+            return pc.new_tensor(0.0)
+
+        return total / n_pairs
+
+    def _compute_surface_loss(self, pc, out_dict, batch, all_matched_slots):
+        if self.surface_target == "gt_surface":
+            return self._compute_gt_surface_loss(
+                out_dict=out_dict,
+                batch=batch,
+                all_matched_slots=all_matched_slots,
+            )
+
+        if self.surface_target == "part_points":
+            return self._compute_part_point_surface_loss(
+                pc=pc,
+                batch=batch,
+                out_dict=out_dict,
+                all_matched_slots=all_matched_slots,
+            )
+
+        raise RuntimeError(f"Unhandled surface_target={self.surface_target!r}")
+
     def forward(self, pc, normals, out_dict, batch):
         assign = out_dict["assign_matrix"]          # [B, N, P]
         exist = out_dict["exist"].squeeze(-1)       # [B, P]
@@ -217,7 +361,7 @@ class SupervisedHungarianLoss(nn.Module):
         labels = batch["labels"].to(assign.device).long()
         K = batch["K"].to(assign.device).long()
 
-        B, N, P = assign.shape
+        B, N, _ = assign.shape
 
         self._forward_calls += 1
         should_debug_print = (
@@ -269,7 +413,6 @@ class SupervisedHungarianLoss(nn.Module):
             # Assignment target
             # --------------------
             target_slot = matched_slots[labels[b]]  # [N]
-
             point_indices = torch.arange(N, device=assign.device)
             chosen_probs = assign[b, point_indices, target_slot]
 
@@ -339,6 +482,7 @@ class SupervisedHungarianLoss(nn.Module):
 
         if self.w_surface > 0.0:
             surface_loss = self._compute_surface_loss(
+                pc=pc,
                 out_dict=out_dict,
                 batch=batch,
                 all_matched_slots=all_matched_slots,
