@@ -125,6 +125,7 @@ class SQZeroLMDB(Dataset):
         <key>              -> points, [N, 3], float32
         <key>.labels       -> primitive labels, [N], int32
         <key>.sq_params    -> SQ params, [K, 11], float32
+        <key>.normals      -> optional point normals, [N, 3], float32
 
     For original SuperDec training, only points/normals are used.
     For supervised Hungarian training later, use:
@@ -291,7 +292,20 @@ class SQZeroLMDB(Dataset):
                 f"Expected points shape [N, 3], got {raw_points.shape} for key={key}"
             )
 
-        # Sample point indices once, then use the same indices for labels.
+        raw_normals = None
+        if self.normal_mode == "sidecar":
+            raw_normals = self._load_array(f"{key}.normals").astype(np.float32, copy=False)
+            if raw_normals.ndim != 2 or raw_normals.shape[1] != 3:
+                raise ValueError(
+                    f"Expected normals shape [N, 3], got {raw_normals.shape} for key={key}"
+                )
+            if raw_normals.shape[0] != raw_points.shape[0]:
+                raise ValueError(
+                    f"normals length {raw_normals.shape[0]} does not match "
+                    f"points length {raw_points.shape[0]} for key={key}"
+                )
+
+        # Sample point indices once, then use the same indices for labels/normals.
         sample_idx = self._sample_indices(raw_points.shape[0])
         points = raw_points[sample_idx].astype(np.float32, copy=False)
 
@@ -375,8 +389,19 @@ class SQZeroLMDB(Dataset):
             normals = _make_radial_normals(points)
         elif self.normal_mode == "zeros":
             normals = np.zeros_like(points, dtype=np.float32)
+        elif self.normal_mode == "sidecar":
+            normals = raw_normals[sample_idx].astype(np.float32, copy=False)
+            # Normalization is translation + isotropic scale only, so normals are
+            # unchanged apart from numerical renormalization. Do not translate or
+            # scale normals.
+            denom = np.linalg.norm(normals, axis=1, keepdims=True)
+            normals = normals / np.maximum(denom, 1e-8)
+            normals = normals.astype(np.float32, copy=False)
         else:
-            raise ValueError(f"Unsupported normal_mode: {self.normal_mode}")
+            raise ValueError(
+                f"Unsupported normal_mode: {self.normal_mode}. "
+                "Expected one of: radial, zeros, sidecar."
+            )
 
         if self.transform is not None:
             t_data = self.transform(points=points, normals=normals)

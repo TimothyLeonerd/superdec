@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from superdec.loss.loss import sampling_from_parametric_space_to_equivalent_points
 from superdec.loss.sampler import EqualDistanceSamplerSQ
@@ -10,6 +11,61 @@ try:
 except ImportError as exc:
     linear_sum_assignment = None
     _SCIPY_IMPORT_ERROR = exc
+
+
+class NaiveGridSamplerSQ:
+    """Uniform parameter-grid sampler matching SQ-Zero naive sampling.
+
+    eta/theta:
+      -pi/2 + pi/(2*n_theta), ..., pi/2 - pi/(2*n_theta)
+
+    omega/phi:
+      -pi + pi/n_phi, ..., pi - pi/n_phi
+
+    This is not equal-distance surface sampling. It intentionally uses a
+    parameter-space grid, like the SQ-Zero naive generator.
+    """
+
+    def __init__(self, n_theta=12, n_phi=12):
+        self.n_theta = int(n_theta)
+        self.n_phi = int(n_phi)
+        if self.n_theta <= 0 or self.n_phi <= 0:
+            raise ValueError(
+                f"NaiveGridSamplerSQ needs positive n_theta/n_phi, got "
+                f"{self.n_theta}/{self.n_phi}"
+            )
+
+        self._n_samples = self.n_theta * self.n_phi
+
+        d_eta = np.pi / self.n_theta
+        d_omega = 2.0 * np.pi / self.n_phi
+
+        eta0 = -np.pi / 2.0 + np.pi / (2.0 * self.n_theta)
+        omega0 = -np.pi + np.pi / self.n_phi
+
+        eta = eta0 + d_eta * np.arange(self.n_theta, dtype=np.float32)
+        omega = omega0 + d_omega * np.arange(self.n_phi, dtype=np.float32)
+
+        # Flatten in theta-outer, omega-inner order, matching sample_SQ_naive.
+        eta_grid = np.repeat(eta[:, None], self.n_phi, axis=1)
+        omega_grid = np.repeat(omega[None, :], self.n_theta, axis=0)
+
+        self._etas = eta_grid.reshape(-1).astype(np.float32)
+        self._omegas = omega_grid.reshape(-1).astype(np.float32)
+
+    @property
+    def n_samples(self):
+        return self._n_samples
+
+    def sample(self, **kwargs):
+        return self._etas.copy(), self._omegas.copy()
+
+    def sample_on_batch(self, shapes, epsilons):
+        B = int(shapes.shape[0])
+        M = int(shapes.shape[1])
+        etas = np.broadcast_to(self._etas.reshape(1, 1, -1), (B, M, self._n_samples))
+        omegas = np.broadcast_to(self._omegas.reshape(1, 1, -1), (B, M, self._n_samples))
+        return etas.copy(), omegas.copy()
 
 
 class SupervisedHungarianLoss(nn.Module):
@@ -66,11 +122,49 @@ class SupervisedHungarianLoss(nn.Module):
         # Keep at 0.0 for real datasets without GT SQ parameters.
         self.w_shape_param = float(getattr(cfg, "w_sup_shape_param", 0.0))
 
+        # Signed part-normal auxiliary loss:
+        #   L = mean(1 - dot(input_normal, nearest_pred_sq_normal))
+        # Requires sqzero_lmdb.normal_mode=sidecar.
+        self.w_normal = float(getattr(cfg, "w_sup_normal", 0.0))
+        self.normal_unsigned = bool(getattr(cfg, "normal_unsigned", False))
+        self.normal_max_points_per_part = int(
+            getattr(cfg, "normal_max_points_per_part", 512)
+        )
+        self.normal_eps = float(getattr(cfg, "normal_eps", 1e-8))
+
+        # Location-independent normal-direction Chamfer.
+        # Compares only normal directions per matched primitive, not xyz positions.
+        self.w_normal_dir = float(getattr(cfg, "w_sup_normal_dir", 0.0))
+        self.normal_dir_beta = float(getattr(cfg, "normal_dir_beta", 0.25))
+
+        # If > 0, downweight normal correspondences whose nearest predicted
+        # surface point is far away:
+        #   gate = exp(-nn_dist^2 / tau^2)
+        # The gate is detached by default so the model cannot game the loss by
+        # changing distances only to change weights.
+
+        # Strict staged SQ geometry loss, v1.  This is optional and is meant
+        # to be enabled together with superdec.decoder.staged_params=true.
+        # The three stage losses reuse the final Hungarian matching but build
+        # surfaces with restricted parameter ownership:
+        #   stage 1: translation only, fixed isotropic sphere
+        #   stage 2: scale + rotation only, detached stage-1 translation
+        #   stage 3: shape only, detached stage-1 translation and stage-2 scale/rotation
+        self.use_staged_surface = bool(getattr(cfg, "use_staged_surface", False))
+        self.stage1_fixed_radius = float(getattr(cfg, "stage1_fixed_radius", 0.575))
+        self.w_stage1_surface = float(getattr(cfg, "w_stage1_surface", 0.0))
+        self.w_stage2_surface = float(getattr(cfg, "w_stage2_surface", 0.0))
+        self.w_stage3_surface = float(getattr(cfg, "w_stage3_surface", 0.0))
+
         # Matching-cost weights. These affect only the discrete Hungarian step.
         self.match_w_assign = float(getattr(cfg, "match_w_assign", 1.0))
         self.match_w_exist = float(getattr(cfg, "match_w_exist", 0.0))
 
         self.eps = float(getattr(cfg, "eps", 1e-8))
+
+        self.w_shape_oracle_surface = float(
+            getattr(cfg, "w_sup_shape_oracle_surface", 0.0)
+        )
 
         # Geometry target.
         self.surface_target = str(getattr(cfg, "surface_target", "gt_surface"))
@@ -81,6 +175,12 @@ class SupervisedHungarianLoss(nn.Module):
                 f"Expected one of {sorted(valid_targets)}."
             )
 
+        if self.use_staged_surface and self.surface_target != "gt_surface":
+            raise ValueError(
+                "loss.use_staged_surface=true currently supports only "
+                "loss.surface_target=gt_surface for strict staged v1."
+            )
+
         # For part-points Chamfer:
         # L = d(part -> pred) + beta * d(pred -> part)
         self.part_cd_beta = float(getattr(cfg, "part_cd_beta", 0.0))
@@ -89,12 +189,34 @@ class SupervisedHungarianLoss(nn.Module):
         )
 
         # Surface sampler.
-        self.surface_n_samples = int(getattr(cfg, "surface_n_samples", 128))
-        self.surface_sampler = EqualDistanceSamplerSQ(
-            n_samples=self.surface_n_samples,
-            D_eta=float(getattr(cfg, "surface_D_eta", 0.05)),
-            D_omega=float(getattr(cfg, "surface_D_omega", 0.05)),
+        self.surface_sampler_type = str(
+            getattr(cfg, "surface_sampler_type", "equal_distance")
         )
+
+        if self.surface_sampler_type == "equal_distance":
+            self.surface_n_samples = int(getattr(cfg, "surface_n_samples", 128))
+            self.surface_sampler = EqualDistanceSamplerSQ(
+                n_samples=self.surface_n_samples,
+                D_eta=float(getattr(cfg, "surface_D_eta", 0.05)),
+                D_omega=float(getattr(cfg, "surface_D_omega", 0.05)),
+            )
+        elif self.surface_sampler_type == "naive":
+            self.surface_naive_n_theta = int(
+                getattr(cfg, "surface_naive_n_theta", 12)
+            )
+            self.surface_naive_n_phi = int(
+                getattr(cfg, "surface_naive_n_phi", 12)
+            )
+            self.surface_sampler = NaiveGridSamplerSQ(
+                n_theta=self.surface_naive_n_theta,
+                n_phi=self.surface_naive_n_phi,
+            )
+            self.surface_n_samples = self.surface_sampler.n_samples
+        else:
+            raise ValueError(
+                f"Unknown loss.surface_sampler_type={self.surface_sampler_type!r}. "
+                "Expected 'equal_distance' or 'naive'."
+            )
 
         # Debug logging.
         self.debug_match_every = int(getattr(cfg, "debug_match_every", 0))
@@ -164,6 +286,21 @@ class SupervisedHungarianLoss(nn.Module):
         ).long()
         return points[idx]
 
+    def _subsample_part_points_and_normals(self, points, normals):
+        """Deterministically subsample paired part points/normals."""
+        max_points = self.normal_max_points_per_part
+
+        if max_points is None or max_points <= 0 or points.shape[0] <= max_points:
+            return points, normals
+
+        idx = torch.linspace(
+            0,
+            points.shape[0] - 1,
+            steps=max_points,
+            device=points.device,
+        ).long()
+        return points[idx], normals[idx]
+
     @torch.no_grad()
     def _hungarian_for_one(self, assign_b, exist_b, labels_b, K_b):
         """Compute GT primitive -> predicted slot matching for one sample.
@@ -210,13 +347,13 @@ class SupervisedHungarianLoss(nn.Module):
             dtype=torch.long,
         )
 
-    def _sample_predicted_surfaces(self, out_dict):
-        """Sample predicted SQ surfaces for all predicted slots.
+    def _sample_predicted_surfaces_and_normals(self, out_dict):
+        """Sample predicted SQ surfaces and outward normals for all slots.
 
-        Returns:
-            pred_world: [B, P, S, 3]
+        Normals are transformed by rotation only. Translation must never be
+        applied to normals.
         """
-        pred_local, _ = sampling_from_parametric_space_to_equivalent_points(
+        pred_local, pred_norm_local = sampling_from_parametric_space_to_equivalent_points(
             out_dict["scale"],
             out_dict["shape"],
             self.surface_sampler,
@@ -228,6 +365,19 @@ class SupervisedHungarianLoss(nn.Module):
             out_dict["trans"],
         )
 
+        pred_norm_local = F.normalize(pred_norm_local, dim=-1, eps=self.normal_eps)
+        pred_norm_world = torch.einsum(
+            "bpij,bpsj->bpsi",
+            out_dict["rotate"],
+            pred_norm_local,
+        )
+        pred_norm_world = F.normalize(pred_norm_world, dim=-1, eps=self.normal_eps)
+
+        return pred_world, pred_norm_world
+
+    def _sample_predicted_surfaces(self, out_dict):
+        """Sample predicted SQ surfaces for all predicted slots."""
+        pred_world, _ = self._sample_predicted_surfaces_and_normals(out_dict)
         return pred_world
 
     def _compute_gt_surface_loss(self, out_dict, batch, all_matched_slots):
@@ -341,6 +491,229 @@ class SupervisedHungarianLoss(nn.Module):
 
         return total / n_pairs
 
+    def _compute_part_normal_loss(self, pc, normals, batch, out_dict, all_matched_slots):
+        """Signed matched part-normal loss against predicted SQ normals."""
+        pred_world, pred_norm_world = self._sample_predicted_surfaces_and_normals(out_dict)
+
+        labels = batch["labels"].to(pc.device).long()
+        K = batch["K"].to(pc.device).long()
+        normals = F.normalize(normals.to(pc.device).float(), dim=-1, eps=self.normal_eps)
+
+        B = pc.shape[0]
+        total = pc.new_tensor(0.0)
+        n_pairs = 0
+
+        dot_sum = 0.0
+        abs_dot_sum = 0.0
+        nn_dist_sum = 0.0
+
+        for b in range(B):
+            K_b = int(K[b].item())
+            matched_slots = all_matched_slots[b]
+
+            for k in range(K_b):
+                part_mask = labels[b] == k
+                if int(part_mask.sum().item()) == 0:
+                    continue
+
+                part_points = pc[b, part_mask, :]
+                part_normals = normals[b, part_mask, :]
+                part_points, part_normals = self._subsample_part_points_and_normals(
+                    part_points,
+                    part_normals,
+                )
+
+                p = int(matched_slots[k].item())
+                pred_points = pred_world[b, p]
+                pred_normals = pred_norm_world[b, p]
+
+                d2 = torch.cdist(
+                    part_points.unsqueeze(0),
+                    pred_points.unsqueeze(0),
+                    p=2.0,
+                )[0] ** 2
+
+                nn_dist2, nn_idx = d2.min(dim=1)
+                nearest_pred_normals = pred_normals[nn_idx]
+
+                dots = (part_normals * nearest_pred_normals).sum(dim=-1).clamp(-1.0, 1.0)
+
+                if self.normal_unsigned:
+                    loss_k = (1.0 - dots.abs()).mean()
+                else:
+                    loss_k = (1.0 - dots).mean()
+
+                total = total + loss_k
+                n_pairs += 1
+
+                with torch.no_grad():
+                    dot_sum += float(dots.mean().detach().cpu().item())
+                    abs_dot_sum += float(dots.abs().mean().detach().cpu().item())
+                    nn_dist_sum += float(torch.sqrt(nn_dist2.clamp_min(0.0)).mean().detach().cpu().item())
+
+        if n_pairs == 0:
+            zero = pc.new_tensor(0.0)
+            return zero, {
+                "sup_normal_dot_mean": 0.0,
+                "sup_normal_absdot_mean": 0.0,
+                "sup_normal_nn_dist_mean": 0.0,
+            }
+
+        return total / n_pairs, {
+            "sup_normal_dot_mean": dot_sum / n_pairs,
+            "sup_normal_absdot_mean": abs_dot_sum / n_pairs,
+            "sup_normal_nn_dist_mean": nn_dist_sum / n_pairs,
+        }
+
+    def _compute_normal_direction_loss(self, normals, batch, out_dict, all_matched_slots):
+        """Location-independent normal-direction Chamfer per matched primitive."""
+        _, pred_norm_world = self._sample_predicted_surfaces_and_normals(out_dict)
+
+        device = pred_norm_world.device
+        labels = batch["labels"].to(device).long()
+        K = batch["K"].to(device).long()
+        normals = F.normalize(normals.to(device).float(), dim=-1, eps=self.normal_eps)
+
+        B = normals.shape[0]
+        total = normals.new_tensor(0.0)
+        n_pairs = 0
+        gt2pred_dot_sum = 0.0
+        pred2gt_dot_sum = 0.0
+
+        for b in range(B):
+            K_b = int(K[b].item())
+            matched_slots = all_matched_slots[b]
+
+            for k in range(K_b):
+                part_mask = labels[b] == k
+                if int(part_mask.sum().item()) == 0:
+                    continue
+
+                part_normals = normals[b, part_mask, :]
+
+                max_points = self.normal_max_points_per_part
+                if max_points is not None and max_points > 0 and part_normals.shape[0] > max_points:
+                    idx = torch.linspace(
+                        0,
+                        part_normals.shape[0] - 1,
+                        steps=max_points,
+                        device=part_normals.device,
+                    ).long()
+                    part_normals = part_normals[idx]
+
+                p = int(matched_slots[k].item())
+                pred_normals = pred_norm_world[b, p]
+
+                sim = torch.matmul(part_normals, pred_normals.transpose(0, 1)).clamp(-1.0, 1.0)
+                if self.normal_unsigned:
+                    sim = sim.abs()
+
+                gt2pred_best = sim.max(dim=1).values
+                pred2gt_best = sim.max(dim=0).values
+
+                loss_k = (1.0 - gt2pred_best).mean()
+                if self.normal_dir_beta > 0.0:
+                    loss_k = loss_k + self.normal_dir_beta * (1.0 - pred2gt_best).mean()
+
+                total = total + loss_k
+                n_pairs += 1
+
+                with torch.no_grad():
+                    gt2pred_dot_sum += float(gt2pred_best.mean().detach().cpu().item())
+                    pred2gt_dot_sum += float(pred2gt_best.mean().detach().cpu().item())
+
+        if n_pairs == 0:
+            zero = normals.new_tensor(0.0)
+            return zero, {
+                "sup_normal_dir_gt2pred_dot_mean": 0.0,
+                "sup_normal_dir_pred2gt_dot_mean": 0.0,
+            }
+
+        return total / n_pairs, {
+            "sup_normal_dir_gt2pred_dot_mean": gt2pred_dot_sum / n_pairs,
+            "sup_normal_dir_pred2gt_dot_mean": pred2gt_dot_sum / n_pairs,
+        }
+
+    def _compute_shape_oracle_surface_loss(self, out_dict, batch, all_matched_slots):
+        """Matched GT-pose/scale + predicted-shape surface Chamfer.
+
+        For each matched GT primitive k and predicted slot p=sigma(k), build:
+
+            pred_oracle = SQ(gt_scale[k], pred_shape[p], gt_rotate[k], gt_trans[k])
+            gt_surface  = SQ(gt_scale[k], gt_shape[k], gt_rotate[k], gt_trans[k])
+
+        Thus the only predicted SQ parameter inside this surface loss is shape
+        = [eps_1, eps_2]. Translation, scale, and rotation are oracle GT values.
+        This is a synthetic diagnostic loss, not a real-data-compatible loss.
+        """
+        required = ["gt_scale", "gt_shape", "gt_rotate", "gt_trans"]
+        missing = [key for key in required if key not in batch]
+        if missing:
+            raise KeyError(
+                "loss.w_sup_shape_oracle_surface > 0 requires GT SQ sidecars; "
+                f"missing batch keys: {missing}"
+            )
+
+        pred_shape = out_dict["shape"]  # [B, P, 2]
+        device = pred_shape.device
+
+        gt_scale = batch["gt_scale"].to(device).float()
+        gt_shape = batch["gt_shape"].to(device).float()
+        gt_rotate = batch["gt_rotate"].to(device).float()
+        gt_trans = batch["gt_trans"].to(device).float()
+        K = batch["K"].to(device).long()
+
+        B = pred_shape.shape[0]
+        total = pred_shape.new_tensor(0.0)
+        n_pairs = 0
+
+        for b in range(B):
+            K_b = int(K[b].item())
+            if K_b <= 0:
+                continue
+
+            matched_slots = all_matched_slots[b][:K_b]
+
+            gt_scale_b = gt_scale[b:b + 1, :K_b, :]
+            gt_shape_b = gt_shape[b:b + 1, :K_b, :]
+            gt_rotate_b = gt_rotate[b:b + 1, :K_b, :, :]
+            gt_trans_b = gt_trans[b:b + 1, :K_b, :]
+
+            # Reorder predicted shapes into GT-primitive order using the same
+            # final Hungarian matching as assignment/existence.
+            pred_shape_b = pred_shape[b:b + 1, matched_slots, :]
+
+            pred_local_b, _ = sampling_from_parametric_space_to_equivalent_points(
+                gt_scale_b,
+                pred_shape_b,
+                self.surface_sampler,
+            )
+            gt_local_b, _ = sampling_from_parametric_space_to_equivalent_points(
+                gt_scale_b,
+                gt_shape_b,
+                self.surface_sampler,
+            )
+
+            pred_world_b = self._local_to_world(
+                pred_local_b,
+                gt_rotate_b,
+                gt_trans_b,
+            )[0]
+            gt_world_b = self._local_to_world(
+                gt_local_b,
+                gt_rotate_b,
+                gt_trans_b,
+            )[0]
+
+            for k in range(K_b):
+                total = total + self._chamfer_squared(pred_world_b[k], gt_world_b[k])
+                n_pairs += 1
+
+        if n_pairs == 0:
+            return pred_shape.new_tensor(0.0)
+
+        return total / n_pairs
+
     def _compute_shape_param_loss(self, out_dict, batch, all_matched_slots):
         """Direct L1 supervision for SQ shape exponents eps_1, eps_2.
 
@@ -381,6 +754,91 @@ class SupervisedHungarianLoss(nn.Module):
             return pred_shape.new_tensor(0.0)
 
         return total / n_pairs
+
+    @staticmethod
+    def _identity_rotation_like(trans):
+        """Create [B, P, 3, 3] identity rotations on the same device/dtype."""
+        B, P, _ = trans.shape
+        eye = torch.eye(3, device=trans.device, dtype=trans.dtype)
+        return eye.view(1, 1, 3, 3).expand(B, P, 3, 3)
+
+    def _make_stage1_sphere_outdict(self, stage1):
+        """Stage 1: translation-only fixed isotropic sphere."""
+        trans = stage1["trans"]
+        scale = torch.full_like(stage1["scale"], self.stage1_fixed_radius)
+        shape = torch.ones_like(stage1["shape"])
+        rotate = self._identity_rotation_like(trans)
+
+        return {
+            "scale": scale,
+            "shape": shape,
+            "rotate": rotate,
+            "trans": trans,
+        }
+
+    def _make_stage2_ellipsoid_outdict(self, stage1, stage2):
+        """Stage 2: scale + rotation only, using detached stage-1 translation."""
+        return {
+            "scale": stage2["scale"],
+            "shape": torch.ones_like(stage2["shape"]),
+            "rotate": stage2["rotate"],
+            "trans": stage1["trans"].detach(),
+        }
+
+    def _make_stage3_shape_outdict(self, stage1, stage2, stage3):
+        """Stage 3: shape only, with detached translation/scale/rotation."""
+        return {
+            "scale": stage2["scale"].detach(),
+            "shape": stage3["shape"],
+            "rotate": stage2["rotate"].detach(),
+            "trans": stage1["trans"].detach(),
+        }
+
+    def _compute_staged_surface_losses(self, out_dict, batch, all_matched_slots):
+        """Compute strict staged GT-surface losses.
+
+        Matching is intentionally not recomputed here.  The final layer's
+        assignment/existence already determined all_matched_slots in forward().
+        """
+        if "staged_outdicts" not in out_dict:
+            raise KeyError(
+                "loss.use_staged_surface=true requires model output "
+                "out_dict['staged_outdicts']. Enable "
+                "superdec.decoder.staged_params=true."
+            )
+
+        staged = out_dict["staged_outdicts"]
+        if len(staged) < 3:
+            raise ValueError(
+                "Strict staged SQ v1 requires at least 3 staged decoder outputs, "
+                f"but got {len(staged)}."
+            )
+
+        stage1 = staged[0]
+        stage2 = staged[1]
+        stage3 = staged[-1]
+
+        stage1_out = self._make_stage1_sphere_outdict(stage1)
+        stage2_out = self._make_stage2_ellipsoid_outdict(stage1, stage2)
+        stage3_out = self._make_stage3_shape_outdict(stage1, stage2, stage3)
+
+        stage1_loss = self._compute_gt_surface_loss(
+            out_dict=stage1_out,
+            batch=batch,
+            all_matched_slots=all_matched_slots,
+        )
+        stage2_loss = self._compute_gt_surface_loss(
+            out_dict=stage2_out,
+            batch=batch,
+            all_matched_slots=all_matched_slots,
+        )
+        stage3_loss = self._compute_gt_surface_loss(
+            out_dict=stage3_out,
+            batch=batch,
+            all_matched_slots=all_matched_slots,
+        )
+
+        return stage1_loss, stage2_loss, stage3_loss
 
     def _compute_surface_loss(self, pc, out_dict, batch, all_matched_slots):
         if self.surface_target == "gt_surface":
@@ -536,6 +994,21 @@ class SupervisedHungarianLoss(nn.Module):
         else:
             surface_loss = assign.new_tensor(0.0)
 
+        if self.use_staged_surface:
+            (
+                stage1_surface_loss,
+                stage2_surface_loss,
+                stage3_surface_loss,
+            ) = self._compute_staged_surface_losses(
+                out_dict=out_dict,
+                batch=batch,
+                all_matched_slots=all_matched_slots,
+            )
+        else:
+            stage1_surface_loss = assign.new_tensor(0.0)
+            stage2_surface_loss = assign.new_tensor(0.0)
+            stage3_surface_loss = assign.new_tensor(0.0)
+
         if self.w_shape_param > 0.0:
             shape_param_loss = self._compute_shape_param_loss(
                 out_dict=out_dict,
@@ -545,18 +1018,76 @@ class SupervisedHungarianLoss(nn.Module):
         else:
             shape_param_loss = assign.new_tensor(0.0)
 
+        if self.w_shape_oracle_surface > 0.0:
+            shape_oracle_surface_loss = self._compute_shape_oracle_surface_loss(
+                out_dict=out_dict,
+                batch=batch,
+                all_matched_slots=all_matched_slots,
+            )
+        else:
+            shape_oracle_surface_loss = assign.new_tensor(0.0)
+
+        if self.w_normal > 0.0:
+            normal_loss, normal_stats = self._compute_part_normal_loss(
+                pc=pc,
+                normals=normals,
+                batch=batch,
+                out_dict=out_dict,
+                all_matched_slots=all_matched_slots,
+            )
+        else:
+            normal_loss = assign.new_tensor(0.0)
+            normal_stats = {
+                "sup_normal_dot_mean": 0.0,
+                "sup_normal_absdot_mean": 0.0,
+                "sup_normal_nn_dist_mean": 0.0,
+            }
+
+        if self.w_normal_dir > 0.0:
+            normal_dir_loss, normal_dir_stats = self._compute_normal_direction_loss(
+                normals=normals,
+                batch=batch,
+                out_dict=out_dict,
+                all_matched_slots=all_matched_slots,
+            )
+        else:
+            normal_dir_loss = assign.new_tensor(0.0)
+            normal_dir_stats = {
+                "sup_normal_dir_gt2pred_dot_mean": 0.0,
+                "sup_normal_dir_pred2gt_dot_mean": 0.0,
+            }
+
         loss = (
             self.w_exist * exist_loss
             + self.w_assign * assign_loss
             + self.w_surface * surface_loss
+            + self.w_stage1_surface * stage1_surface_loss
+            + self.w_stage2_surface * stage2_surface_loss
+            + self.w_stage3_surface * stage3_surface_loss
             + self.w_shape_param * shape_param_loss
+            + self.w_shape_oracle_surface * shape_oracle_surface_loss
+            + self.w_normal * normal_loss
+            + self.w_normal_dir * normal_dir_loss
         )
 
         loss_dict = {
             "sup_exist_loss": float(exist_loss.detach().cpu().item()),
             "sup_assign_loss": float(assign_loss.detach().cpu().item()),
             "sup_surface_loss": float(surface_loss.detach().cpu().item()),
+            "sup_stage1_surface_loss": float(stage1_surface_loss.detach().cpu().item()),
+            "sup_stage2_surface_loss": float(stage2_surface_loss.detach().cpu().item()),
+            "sup_stage3_surface_loss": float(stage3_surface_loss.detach().cpu().item()),
             "sup_shape_param_loss": float(shape_param_loss.detach().cpu().item()),
+            "sup_shape_oracle_surface_loss": float(
+                shape_oracle_surface_loss.detach().cpu().item()
+            ),
+            "sup_normal_loss": float(normal_loss.detach().cpu().item()),
+            "sup_normal_dot_mean": normal_stats["sup_normal_dot_mean"],
+            "sup_normal_absdot_mean": normal_stats["sup_normal_absdot_mean"],
+            "sup_normal_nn_dist_mean": normal_stats["sup_normal_nn_dist_mean"],
+            "sup_normal_dir_loss": float(normal_dir_loss.detach().cpu().item()),
+            "sup_normal_dir_gt2pred_dot_mean": normal_dir_stats["sup_normal_dir_gt2pred_dot_mean"],
+            "sup_normal_dir_pred2gt_dot_mean": normal_dir_stats["sup_normal_dir_pred2gt_dot_mean"],
             "sup_assign_acc": total_assign_acc / B,
             "sup_count_acc": total_count_acc / B,
             "sup_pred_count": total_pred_count / B,

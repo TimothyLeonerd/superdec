@@ -22,6 +22,7 @@ superdec:
     deep_supervision: False
     pos_encoding_type: sinusoidal
     dropout: 0.1
+    staged_params: false
   point_encoder:
     in_channels: 3
     out_channels: 128
@@ -122,10 +123,44 @@ loss:
 
   w_sup_surface: 0.0
 
+  # Strict staged SQ geometry v1.
+  # Used only when loss.type=supervised_hungarian and
+  # superdec.decoder.staged_params=true.
+  use_staged_surface: false
+  stage1_fixed_radius: 0.575
+  w_stage1_surface: 0.0
+  w_stage2_surface: 0.0
+  w_stage3_surface: 0.0
+
   # Synthetic-only helper loss for SQ-Zero:
   # directly supervise eps_1, eps_2 after Hungarian matching.
   # Keep 0.0 for real datasets without GT SQ parameters.
   w_sup_shape_param: 0.0
+
+  # Synthetic diagnostic:
+  # GT trans/scale/rotate + predicted shape vs full GT SQ surface.
+  # Isolates whether eps_1/eps_2 can be learned geometrically.
+  w_sup_shape_oracle_surface: 0.0
+
+  # Part-normal auxiliary loss. Requires sqzero_lmdb.normal_mode=sidecar
+  # and <key>.normals LMDB sidecars.
+  # Signed default: L = mean(1 - dot(input_normal, nearest_pred_sq_normal)).
+  w_sup_normal: 0.0
+  normal_unsigned: false
+  normal_max_points_per_part: 512
+  normal_eps: 1.0e-8
+
+  # Location-independent normal-direction Chamfer.
+  # Uses only normal directions, not xyz nearest neighbors.
+  w_sup_normal_dir: 0.0
+  normal_dir_beta: 0.25
+
+  # Surface sampler for supervised SQ surface losses.
+  # equal_distance = original SuperDec/Pilu-style sampler
+  # naive = uniform parameter-grid sampler matching SQ-Zero naive sampling
+  surface_sampler_type: equal_distance
+  surface_naive_n_theta: 12
+  surface_naive_n_phi: 12
   surface_n_samples: 128
   surface_D_eta: 0.05
   surface_D_omega: 0.05

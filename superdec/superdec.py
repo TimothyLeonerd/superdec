@@ -14,6 +14,7 @@ class SuperDec(nn.Module):
         self.n_heads = ctx.decoder.n_heads
         self.n_queries = ctx.decoder.n_queries
         self.deep_supervision = ctx.decoder.deep_supervision
+        self.staged_params = bool(getattr(ctx.decoder, "staged_params", False))
         self.pos_encoding_type = ctx.decoder.pos_encoding_type
         self.dim_feedforward = ctx.decoder.dim_feedforward
         self.emb_dims = ctx.point_encoder.l3.out_channels # output dimension of pvcnn
@@ -62,5 +63,32 @@ class SuperDec(nn.Module):
 
         if self.lm_optimization:
             outdict_list[-1] = self.lm_optimizer(outdict_list[-1], x)
-            
+
+        if self.staged_params:
+            if len(outdict_list) < 3:
+                raise RuntimeError(
+                    "superdec.decoder.staged_params=true requires at least 3 decoder "
+                    f"layers, but got {len(outdict_list)}."
+                )
+
+            # Strict staged SQ parameter ownership, v1:
+            #   stage 1 / layer 0: translation
+            #   stage 2 / layer 1: scale + rotation
+            #   stage 3 / final layer: shape + assignment/existence
+            #
+            # Keep the raw per-layer outputs so the supervised loss can apply
+            # stage-specific geometry losses with explicit detach/stop-gradient.
+            stage1 = outdict_list[0]
+            stage2 = outdict_list[1]
+            stage3 = outdict_list[-1]
+
+            outdict = dict(stage3)
+            outdict["trans"] = stage1["trans"]
+            outdict["scale"] = stage2["scale"]
+            outdict["rotate"] = stage2["rotate"]
+            outdict["shape"] = stage3["shape"]
+            outdict["staged_outdicts"] = outdict_list
+            outdict["staged_params_mode"] = "strict_v1"
+            return outdict
+
         return outdict_list[-1]
