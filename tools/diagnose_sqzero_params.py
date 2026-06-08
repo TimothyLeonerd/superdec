@@ -17,6 +17,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from superdec.superdec import SuperDec
+from superdec.lm_optimization.lm_optimizer import LMOptimizer
 from superdec.data.sqzero_lmdb import SQZeroLMDB
 
 
@@ -48,7 +49,7 @@ def load_checkpoint_state(path: Path):
     return cleaned
 
 
-def load_model(ckpt_path: Path, cfg_path: Path, device):
+def load_model(ckpt_path: Path, cfg_path: Path, device, use_lm: bool = False):
     cfg = OmegaConf.load(cfg_path)
     model = SuperDec(cfg.superdec).to(device)
 
@@ -64,6 +65,13 @@ def load_model(ckpt_path: Path, cfg_path: Path, device):
         print(f"[WARN] {ckpt_path}: unexpected keys: {len(unexpected)}")
         for k in unexpected[:10]:
             print(f"  unexpected: {k}")
+
+    if use_lm:
+        model.lm_optimizer = LMOptimizer().to(device)
+        model.lm_optimization = True
+        print(f"[INFO] LM optimization enabled for {ckpt_path}")
+    else:
+        model.lm_optimization = False
 
     model.eval()
     return model, cfg
@@ -395,20 +403,24 @@ def plot_pred_vs_gt(rows, models, gt_key, pred_key, out_path):
     plt.close()
 
 
-def make_plots(rows, models, out_dir):
+def make_plots(rows, models, out_dir, plot_mode="all"):
+    if plot_mode == "none":
+        return
+
     plot_dir = out_dir / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
 
-    for key in [
-        "scale_l1",
-        "shape_l1",
-        "trans_l2",
-        "rot_geodesic_deg",
-        "eps_1_abs_err",
-        "eps_2_abs_err",
-        "exist_prob",
-    ]:
-        plot_error_hist(rows, models, key, plot_dir / f"hist_{key}.png")
+    if plot_mode == "all":
+        for key in [
+            "scale_l1",
+            "shape_l1",
+            "trans_l2",
+            "rot_geodesic_deg",
+            "eps_1_abs_err",
+            "eps_2_abs_err",
+            "exist_prob",
+        ]:
+            plot_error_hist(rows, models, key, plot_dir / f"hist_{key}.png")
 
     pairs = [
         ("gt_scale_x", "pred_scale_x"),
@@ -424,7 +436,7 @@ def make_plots(rows, models, out_dir):
     for gt_key, pred_key in pairs:
         plot_pred_vs_gt(rows, models, gt_key, pred_key, plot_dir / f"scatter_{pred_key}_vs_{gt_key}.png")
 
-    print(f"Wrote plots to: {plot_dir}")
+    print(f"Wrote {plot_mode} plots to: {plot_dir}")
 
 
 def main():
@@ -433,6 +445,8 @@ def main():
     ap.add_argument("--names", nargs="+", required=True)
     ap.add_argument("--ckpts", nargs="+", type=Path, required=True)
     ap.add_argument("--cfgs", nargs="+", type=Path, required=True)
+    ap.add_argument("--lm-names", nargs="*", default=[],
+                    help="Model names for which LM optimization should be enabled.")
 
     ap.add_argument("--data-root", type=Path, required=True)
     ap.add_argument("--split", type=str, default="test.txt")
@@ -446,6 +460,9 @@ def main():
     ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--device", type=str, default="cuda")
+    ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--no-detail-csv", action="store_true")
+    ap.add_argument("--plot-mode", choices=["all", "scatter", "none"], default="all")
 
     ap.add_argument("--match-w-assign", type=float, default=1.0)
     ap.add_argument("--match-w-exist", type=float, default=0.0)
@@ -464,11 +481,14 @@ def main():
     models = []
     cfg0 = None
 
+    lm_names = set(args.lm_names)
+
     for name, ckpt, cfg_path in zip(args.names, args.ckpts, args.cfgs):
         print(f"Loading {name}:")
         print(f"  ckpt={ckpt}")
         print(f"  cfg={cfg_path}")
-        model, cfg = load_model(ckpt, cfg_path, device)
+        use_lm = name in lm_names
+        model, cfg = load_model(ckpt, cfg_path, device, use_lm=use_lm)
         models.append((name, model))
         if cfg0 is None:
             cfg0 = cfg
@@ -487,7 +507,7 @@ def main():
     all_rows = []
     global_index = 0
 
-    for batch in tqdm(loader, desc="batches"):
+    for batch in tqdm(loader, desc="batches", disable=args.quiet):
         B = batch["points"].shape[0]
 
         for name, model in models:
@@ -506,11 +526,15 @@ def main():
     detail_csv = args.out_dir / "matched_param_details.csv"
     summary_csv = args.out_dir / "matched_param_summary.csv"
 
-    write_csv(all_rows, detail_csv)
-    summarize(all_rows, args.names, summary_csv)
-    make_plots(all_rows, args.names, args.out_dir)
+    if not args.no_detail_csv:
+        write_csv(all_rows, detail_csv)
+        print(f"Wrote: {detail_csv}")
+    else:
+        print("Skipped matched_param_details.csv (--no-detail-csv)")
 
-    print(f"Wrote: {detail_csv}")
+    summarize(all_rows, args.names, summary_csv)
+    make_plots(all_rows, args.names, args.out_dir, plot_mode=args.plot_mode)
+
     print(f"Wrote: {summary_csv}")
 
 

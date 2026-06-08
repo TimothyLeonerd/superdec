@@ -12,6 +12,23 @@ import matplotlib.pyplot as plt
 PHASE_RE = re.compile(r"(Epoch|Eval)\s+(\d+)/(\d+):")
 KV_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)")
 
+USEFUL_METRICS = [
+    "all",
+    "sup_exist_loss",
+    "sup_assign_loss",
+    "sup_surface_loss",
+    "sup_shape_oracle_surface_loss",
+    "sup_normal_loss",
+    "sup_normal_dot_mean",
+    "sup_normal_absdot_mean",
+    "sup_normal_nn_dist_mean",
+    "sup_assign_acc",
+    "sup_count_acc",
+    "sup_pred_count",
+    "sup_soft_count",
+    "sup_true_count",
+]
+
 DEBUG_RE = re.compile(
     r"\[HungarianDebug\]\s+"
     r"call=(?P<call>\d+)\s+"
@@ -321,13 +338,9 @@ def main():
     else:
         out_dir = args.out_dir
 
-    raw_dir = out_dir / "raw"
     epoch_dir = out_dir / "epoch_mean"
-    zoom_dir = out_dir / "epoch_mean_zoom"
-    log_dir = out_dir / "epoch_mean_log"
-    debug_dir = out_dir / "debug"
 
-    for d in [out_dir, raw_dir, epoch_dir, zoom_dir, log_dir, debug_dir]:
+    for d in [out_dir, epoch_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
     metric_rows = parse_metric_rows(logfile)
@@ -344,50 +357,21 @@ def main():
         epoch_csv = out_dir / "metrics_epoch_mean.csv"
         write_csv(epoch_rows, epoch_csv)
 
-        all_metrics = sorted(
-            {
-                k
-                for r in metric_rows
-                for k in r.keys()
-                if k not in {"phase", "epoch", "step_in_epoch"}
-            }
-        )
+        discovered_metrics = {
+            k
+            for r in metric_rows
+            for k in r.keys()
+            if k not in {"phase", "epoch", "step_in_epoch"}
+        }
+        all_metrics = [m for m in USEFUL_METRICS if m in discovered_metrics]
 
         for metric in all_metrics:
-            plot_metric_raw(metric_rows, metric, raw_dir / f"{metric}_raw.png")
             plot_metric_epoch_mean(epoch_rows, metric, epoch_dir / f"{metric}_epoch_mean.png")
-
-            y_limit = zoom_limit_for_metric(
-                epoch_rows,
-                metric,
-                skip_first_epochs=args.zoom_skip_first_epochs,
-                q=args.zoom_quantile,
-            )
-            if y_limit is not None:
-                plot_metric_epoch_mean(
-                    epoch_rows,
-                    metric,
-                    zoom_dir / f"{metric}_epoch_mean_zoom.png",
-                    y_limit=y_limit,
-                )
-
-            if should_make_log_plot(metric):
-                # Avoid log(0) display issues by relying on matplotlib;
-                # exact zeros will simply not be shown well, which is fine for loss diagnostics.
-                plot_metric_epoch_mean(
-                    epoch_rows,
-                    metric,
-                    log_dir / f"{metric}_epoch_mean_log.png",
-                    log_y=True,
-                )
 
         print(f"Parsed metric rows: {len(metric_rows)}")
         print(f"Wrote raw CSV: {metrics_csv}")
         print(f"Wrote epoch-mean CSV: {epoch_csv}")
-        print(f"Wrote raw plots to: {raw_dir}")
-        print(f"Wrote epoch-mean plots to: {epoch_dir}")
-        print(f"Wrote zoomed epoch-mean plots to: {zoom_dir}")
-        print(f"Wrote log-y epoch-mean plots to: {log_dir}")
+        print(f"Wrote selected epoch-mean plots to: {epoch_dir}")
         print("Metrics:")
         for m in all_metrics:
             print(f"  {m}")
@@ -396,25 +380,8 @@ def main():
         debug_csv = out_dir / "hungarian_debug.csv"
         write_csv(debug_rows, debug_csv)
 
-        debug_metrics = sorted(
-            {
-                k
-                for r in debug_rows
-                for k in r.keys()
-                if (
-                    k.startswith("match_gt")
-                    or k.startswith("exist_slot")
-                    or k in {"soft_count", "pred_count", "assign_acc"}
-                )
-            }
-        )
-
-        for metric in debug_metrics:
-            plot_debug_metric(debug_rows, metric, debug_dir / f"debug_{metric}.png")
-
         print(f"Parsed Hungarian debug rows: {len(debug_rows)}")
-        print(f"Wrote debug CSV: {debug_csv}")
-        print(f"Wrote debug plots to: {debug_dir}")
+        print(f"Wrote debug CSV only: {debug_csv}")
 
     print(f"Wrote all outputs to: {out_dir}")
 

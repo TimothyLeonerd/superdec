@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from superdec.superdec import SuperDec
+from superdec.lm_optimization.lm_optimizer import LMOptimizer
 from superdec.data.sqzero_lmdb import SQZeroLMDB
 from superdec.loss.loss import sampling_from_parametric_space_to_equivalent_points
 from superdec.loss.sampler import EqualDistanceSamplerSQ
@@ -51,7 +52,7 @@ def load_checkpoint_state(path: Path):
     return cleaned
 
 
-def load_model(ckpt_path: Path, cfg_path: Path, device: torch.device):
+def load_model(ckpt_path: Path, cfg_path: Path, device: torch.device, use_lm: bool = False):
     cfg = OmegaConf.load(cfg_path)
 
     model = SuperDec(cfg.superdec).to(device)
@@ -72,6 +73,13 @@ def load_model(ckpt_path: Path, cfg_path: Path, device: torch.device):
             print(f"  {k}")
         if len(unexpected) > 20:
             print(f"  ... {len(unexpected) - 20} more")
+
+    if use_lm:
+        model.lm_optimizer = LMOptimizer().to(device)
+        model.lm_optimization = True
+        print(f"[INFO] LM optimization enabled for {ckpt_path}")
+    else:
+        model.lm_optimization = False
 
     model.eval()
     return model, cfg
@@ -320,7 +328,7 @@ def evaluate_model(model, name, loader, sampler, args, device):
 
     n_samples = 0
 
-    for batch in tqdm(loader, desc=f"eval {name}"):
+    for batch in tqdm(loader, desc=f"eval {name}", disable=args.quiet):
         points = batch["points"].to(device).float()      # [B,N,3]
         labels = batch["labels"].to(device).long()       # [B,N]
         K = batch["K"].to(device).long()                 # [B]
@@ -590,6 +598,9 @@ def main():
     ap.add_argument("--name-a", type=str, default="model_a")
     ap.add_argument("--name-b", type=str, default="model_b")
 
+    ap.add_argument("--use-lm-a", action="store_true")
+    ap.add_argument("--use-lm-b", action="store_true")
+
     ap.add_argument("--cfg-a", type=Path, default=None)
     ap.add_argument("--cfg-b", type=Path, default=None)
 
@@ -605,6 +616,7 @@ def main():
     ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--device", type=str, default="cuda")
+    ap.add_argument("--quiet", action="store_true")
 
     ap.add_argument("--surface-n-samples", type=int, default=1024)
     ap.add_argument("--surface-D-eta", type=float, default=0.05)
@@ -640,8 +652,8 @@ def main():
     print(f"  ckpt: {args.ckpt_b}")
     print(f"  cfg:  {cfg_b_path}")
 
-    model_a, cfg_a = load_model(args.ckpt_a, cfg_a_path, device)
-    model_b, cfg_b = load_model(args.ckpt_b, cfg_b_path, device)
+    model_a, cfg_a = load_model(args.ckpt_a, cfg_a_path, device, use_lm=args.use_lm_a)
+    model_b, cfg_b = load_model(args.ckpt_b, cfg_b_path, device, use_lm=args.use_lm_b)
 
     eval_cfg = make_eval_cfg(cfg_a, args)
     dataset = SQZeroLMDB(split="val", cfg=eval_cfg)
