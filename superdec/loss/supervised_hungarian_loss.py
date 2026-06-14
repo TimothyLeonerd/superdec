@@ -118,6 +118,10 @@ class SupervisedHungarianLoss(nn.Module):
         self.w_surface = float(getattr(cfg, "w_sup_surface", 0.0))
 
         # Synthetic-only helper loss for SQ-Zero:
+        # sign-invariant supervision of SQ local z-axis after Hungarian matching.
+        self.w_z_axis = float(getattr(cfg, "w_sup_z_axis", 0.0))
+
+        # Synthetic-only helper loss for SQ-Zero:
         # directly supervise eps_1, eps_2 after Hungarian matching.
         # Keep at 0.0 for real datasets without GT SQ parameters.
         self.w_shape_param = float(getattr(cfg, "w_sup_shape_param", 0.0))
@@ -165,6 +169,23 @@ class SupervisedHungarianLoss(nn.Module):
         self.w_shape_oracle_surface = float(
             getattr(cfg, "w_sup_shape_oracle_surface", 0.0)
         )
+
+        # Synthetic diagnostic:
+        # choose eta/omega samples from high-curvature regions of the GT SQ,
+        # then compare predicted-vs-GT points at exactly those same eta/omega.
+        self.w_highcurv_pointwise_surface = float(
+            getattr(cfg, "w_sup_highcurv_pointwise_surface", 0.0)
+        )
+        self.w_highcurv_chamfer_surface = float(
+            getattr(cfg, "w_sup_highcurv_chamfer_surface", 0.0)
+        )
+        self.highcurv_n_samples = int(getattr(cfg, "highcurv_n_samples", 128))
+        self.highcurv_eta_bins = int(getattr(cfg, "highcurv_eta_bins", 32))
+        self.highcurv_omega_bins = int(getattr(cfg, "highcurv_omega_bins", 64))
+        self.highcurv_alpha = float(getattr(cfg, "highcurv_alpha", 2.0))
+        self.highcurv_uniform_mix = float(getattr(cfg, "highcurv_uniform_mix", 0.0))
+        self.highcurv_jitter = float(getattr(cfg, "highcurv_jitter", 1.0))
+        self.highcurv_probe_delta = float(getattr(cfg, "highcurv_probe_delta", 0.05))
 
         # Geometry target.
         self.surface_target = str(getattr(cfg, "surface_target", "gt_surface"))
@@ -634,6 +655,307 @@ class SupervisedHungarianLoss(nn.Module):
             "sup_normal_dir_pred2gt_dot_mean": pred2gt_dot_sum / n_pairs,
         }
 
+    def _sq_local_from_eta_omega(self, shape_params, epsilons, etas, omegas):
+        """Evaluate SQ local surface points/normals at fixed eta/omega.
+
+        Args:
+            shape_params: [B, M, 3]
+            epsilons:     [B, M, 2]
+            etas:         [B, M, S]
+            omegas:       [B, M, S]
+        """
+        def fexp(x, p):
+            return torch.sign(x) * (torch.abs(x) ** p)
+
+        a1 = shape_params[:, :, 0].unsqueeze(-1)
+        a2 = shape_params[:, :, 1].unsqueeze(-1)
+        a3 = shape_params[:, :, 2].unsqueeze(-1)
+        e1 = epsilons[:, :, 0].unsqueeze(-1)
+        e2 = epsilons[:, :, 1].unsqueeze(-1)
+
+        x = a1 * fexp(torch.cos(etas), e1) * fexp(torch.cos(omegas), e2)
+        y = a2 * fexp(torch.cos(etas), e1) * fexp(torch.sin(omegas), e2)
+        z = a3 * fexp(torch.sin(etas), e1)
+
+        # Match the numerical guard used by the original SuperDec sampler.
+        tiny = x.new_tensor(1e-6)
+        x = ((x > 0).float() * 2 - 1) * torch.max(torch.abs(x), tiny)
+        y = ((y > 0).float() * 2 - 1) * torch.max(torch.abs(y), tiny)
+        z = ((z > 0).float() * 2 - 1) * torch.max(torch.abs(z), tiny)
+
+        nx = (torch.cos(etas) ** 2) * (torch.cos(omegas) ** 2) / x
+        ny = (torch.cos(etas) ** 2) * (torch.sin(omegas) ** 2) / y
+        nz = (torch.sin(etas) ** 2) / z
+
+        points = torch.stack([x, y, z], dim=-1)
+        normals = F.normalize(torch.stack([nx, ny, nz], dim=-1), dim=-1, eps=self.normal_eps)
+        return points, normals
+
+    @torch.no_grad()
+    def _sample_gt_highcurv_eta_omega(self, gt_scale, gt_shape):
+        """Sample fixed-count eta/omega locations biased to GT high-curvature regions.
+
+        Curvature proxy = local normal variation on a dense parameter grid.
+        Output is [B, M, S] eta/omega. Selection is non-differentiable on purpose.
+        """
+        B, M, _ = gt_scale.shape
+        device = gt_scale.device
+        dtype = gt_scale.dtype
+
+        eta_bins = self.highcurv_eta_bins
+        omega_bins = self.highcurv_omega_bins
+        n_samples = self.highcurv_n_samples
+
+        if eta_bins <= 1 or omega_bins <= 1 or n_samples <= 0:
+            raise ValueError(
+                "highcurv_eta_bins, highcurv_omega_bins, highcurv_n_samples must be positive"
+            )
+
+        d_eta = np.pi / eta_bins
+        d_omega = 2.0 * np.pi / omega_bins
+
+        eta_centers_1d = torch.linspace(
+            -np.pi / 2.0 + d_eta / 2.0,
+            np.pi / 2.0 - d_eta / 2.0,
+            eta_bins,
+            device=device,
+            dtype=dtype,
+        )
+        omega_centers_1d = torch.linspace(
+            -np.pi + d_omega / 2.0,
+            np.pi - d_omega / 2.0,
+            omega_bins,
+            device=device,
+            dtype=dtype,
+        )
+
+        eta_grid, omega_grid = torch.meshgrid(
+            eta_centers_1d,
+            omega_centers_1d,
+            indexing="ij",
+        )
+        eta_flat = eta_grid.reshape(-1)
+        omega_flat = omega_grid.reshape(-1)
+        G = eta_flat.numel()
+
+        etas = eta_flat.view(1, 1, G).expand(B, M, G)
+        omegas = omega_flat.view(1, 1, G).expand(B, M, G)
+
+        delta_eta = min(float(self.highcurv_probe_delta), 0.45 * d_eta)
+        delta_omega = min(float(self.highcurv_probe_delta), 0.45 * d_omega)
+
+        eta_min = -np.pi / 2.0 + 1e-4
+        eta_max = np.pi / 2.0 - 1e-4
+
+        eta_p = torch.clamp(etas + delta_eta, eta_min, eta_max)
+        eta_m = torch.clamp(etas - delta_eta, eta_min, eta_max)
+        omega_p = omegas + delta_omega
+        omega_m = omegas - delta_omega
+
+        _, n_eta_p = self._sq_local_from_eta_omega(gt_scale, gt_shape, eta_p, omegas)
+        _, n_eta_m = self._sq_local_from_eta_omega(gt_scale, gt_shape, eta_m, omegas)
+        _, n_omega_p = self._sq_local_from_eta_omega(gt_scale, gt_shape, etas, omega_p)
+        _, n_omega_m = self._sq_local_from_eta_omega(gt_scale, gt_shape, etas, omega_m)
+
+        curv = (
+            torch.linalg.norm(n_eta_p - n_eta_m, dim=-1)
+            + torch.linalg.norm(n_omega_p - n_omega_m, dim=-1)
+        )
+
+        weights = (curv.clamp_min(0.0) + 1e-8) ** self.highcurv_alpha
+        weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+        mix = float(self.highcurv_uniform_mix)
+        if mix > 0.0:
+            mix = max(0.0, min(1.0, mix))
+            weights = (1.0 - mix) * weights + mix * (1.0 / G)
+
+        idx = torch.multinomial(
+            weights.reshape(B * M, G),
+            num_samples=n_samples,
+            replacement=True,
+        )
+
+        eta_sel = eta_flat[idx].view(B, M, n_samples)
+        omega_sel = omega_flat[idx].view(B, M, n_samples)
+
+        jitter = float(self.highcurv_jitter)
+        if jitter > 0.0:
+            eta_sel = eta_sel + (torch.rand_like(eta_sel) - 0.5) * d_eta * jitter
+            omega_sel = omega_sel + (torch.rand_like(omega_sel) - 0.5) * d_omega * jitter
+            eta_sel = torch.clamp(eta_sel, eta_min, eta_max)
+
+        return eta_sel, omega_sel
+
+    def _compute_highcurv_chamfer_surface_loss(self, out_dict, batch, all_matched_slots):
+        """GT-conditioned high-curvature Chamfer surface loss.
+
+        Uses GT SQ only to choose high-curvature eta/omega sample locations.
+        Then evaluates GT and predicted SQs at those eta/omega locations, but
+        compares the resulting point sets with Chamfer instead of pointwise L2.
+        """
+        required = ["gt_scale", "gt_shape", "gt_rotate", "gt_trans"]
+        missing = [key for key in required if key not in batch]
+        if missing:
+            raise KeyError(
+                "loss.w_sup_highcurv_chamfer_surface > 0 requires GT SQ sidecars; "
+                f"missing batch keys: {missing}"
+            )
+
+        pred_scale = out_dict["scale"]
+        pred_shape = out_dict["shape"]
+        pred_rotate = out_dict["rotate"]
+        pred_trans = out_dict["trans"]
+
+        device = pred_scale.device
+        gt_scale = batch["gt_scale"].to(device).float()
+        gt_shape = batch["gt_shape"].to(device).float()
+        gt_rotate = batch["gt_rotate"].to(device).float()
+        gt_trans = batch["gt_trans"].to(device).float()
+        K = batch["K"].to(device).long()
+
+        B = pred_scale.shape[0]
+        total = pred_scale.new_tensor(0.0)
+        n_pairs = 0
+
+        for b in range(B):
+            K_b = int(K[b].item())
+            if K_b <= 0:
+                continue
+
+            matched_slots = all_matched_slots[b][:K_b]
+
+            gt_scale_b = gt_scale[b:b + 1, :K_b, :]
+            gt_shape_b = gt_shape[b:b + 1, :K_b, :]
+            gt_rotate_b = gt_rotate[b:b + 1, :K_b, :, :]
+            gt_trans_b = gt_trans[b:b + 1, :K_b, :]
+
+            pred_scale_b = pred_scale[b:b + 1, matched_slots, :]
+            pred_shape_b = pred_shape[b:b + 1, matched_slots, :]
+            pred_rotate_b = pred_rotate[b:b + 1, matched_slots, :, :]
+            pred_trans_b = pred_trans[b:b + 1, matched_slots, :]
+
+            etas, omegas = self._sample_gt_highcurv_eta_omega(gt_scale_b, gt_shape_b)
+
+            pred_local_b, _ = self._sq_local_from_eta_omega(
+                pred_scale_b,
+                pred_shape_b,
+                etas,
+                omegas,
+            )
+            gt_local_b, _ = self._sq_local_from_eta_omega(
+                gt_scale_b,
+                gt_shape_b,
+                etas,
+                omegas,
+            )
+
+            pred_world_b = self._local_to_world(
+                pred_local_b,
+                pred_rotate_b,
+                pred_trans_b,
+            )[0]
+            gt_world_b = self._local_to_world(
+                gt_local_b,
+                gt_rotate_b,
+                gt_trans_b,
+            )[0]
+
+            for k in range(K_b):
+                total = total + self._chamfer_squared(pred_world_b[k], gt_world_b[k])
+                n_pairs += 1
+
+        if n_pairs == 0:
+            return pred_scale.new_tensor(0.0)
+
+        return total / n_pairs
+
+    def _compute_highcurv_pointwise_surface_loss(self, out_dict, batch, all_matched_slots):
+        """GT-conditioned high-curvature pointwise surface loss.
+
+        For each matched pair (GT primitive k, predicted slot p):
+          1. pick eta/omega from high-curvature regions of the GT primitive;
+          2. evaluate GT and prediction at the same eta/omega;
+          3. use pointwise squared distance.
+
+        This gives explicit parameter-space correspondence.
+        """
+        required = ["gt_scale", "gt_shape", "gt_rotate", "gt_trans"]
+        missing = [key for key in required if key not in batch]
+        if missing:
+            raise KeyError(
+                "loss.w_sup_highcurv_pointwise_surface > 0 requires GT SQ sidecars; "
+                f"missing batch keys: {missing}"
+            )
+
+        pred_scale = out_dict["scale"]
+        pred_shape = out_dict["shape"]
+        pred_rotate = out_dict["rotate"]
+        pred_trans = out_dict["trans"]
+
+        device = pred_scale.device
+        gt_scale = batch["gt_scale"].to(device).float()
+        gt_shape = batch["gt_shape"].to(device).float()
+        gt_rotate = batch["gt_rotate"].to(device).float()
+        gt_trans = batch["gt_trans"].to(device).float()
+        K = batch["K"].to(device).long()
+
+        B = pred_scale.shape[0]
+        total = pred_scale.new_tensor(0.0)
+        n_pairs = 0
+
+        for b in range(B):
+            K_b = int(K[b].item())
+            if K_b <= 0:
+                continue
+
+            matched_slots = all_matched_slots[b][:K_b]
+
+            gt_scale_b = gt_scale[b:b + 1, :K_b, :]
+            gt_shape_b = gt_shape[b:b + 1, :K_b, :]
+            gt_rotate_b = gt_rotate[b:b + 1, :K_b, :, :]
+            gt_trans_b = gt_trans[b:b + 1, :K_b, :]
+
+            pred_scale_b = pred_scale[b:b + 1, matched_slots, :]
+            pred_shape_b = pred_shape[b:b + 1, matched_slots, :]
+            pred_rotate_b = pred_rotate[b:b + 1, matched_slots, :, :]
+            pred_trans_b = pred_trans[b:b + 1, matched_slots, :]
+
+            etas, omegas = self._sample_gt_highcurv_eta_omega(gt_scale_b, gt_shape_b)
+
+            pred_local_b, _ = self._sq_local_from_eta_omega(
+                pred_scale_b,
+                pred_shape_b,
+                etas,
+                omegas,
+            )
+            gt_local_b, _ = self._sq_local_from_eta_omega(
+                gt_scale_b,
+                gt_shape_b,
+                etas,
+                omegas,
+            )
+
+            pred_world_b = self._local_to_world(
+                pred_local_b,
+                pred_rotate_b,
+                pred_trans_b,
+            )[0]
+            gt_world_b = self._local_to_world(
+                gt_local_b,
+                gt_rotate_b,
+                gt_trans_b,
+            )[0]
+
+            per_primitive = ((pred_world_b - gt_world_b) ** 2).sum(dim=-1).mean(dim=-1)
+            total = total + per_primitive.sum()
+            n_pairs += K_b
+
+        if n_pairs == 0:
+            return pred_scale.new_tensor(0.0)
+
+        return total / n_pairs
+
     def _compute_shape_oracle_surface_loss(self, out_dict, batch, all_matched_slots):
         """Matched GT-pose/scale + predicted-shape surface Chamfer.
 
@@ -713,6 +1035,51 @@ class SupervisedHungarianLoss(nn.Module):
             return pred_shape.new_tensor(0.0)
 
         return total / n_pairs
+
+    def _compute_z_axis_loss(self, out_dict, batch, all_matched_slots):
+        """Sign-invariant local z-axis supervision.
+
+        L_z = mean_k 1 - (dot(z_pred, z_gt)^2)
+
+        z_pred and -z_pred are treated as equivalent.
+        """
+        if "gt_rotate" not in batch:
+            raise KeyError(
+                "loss.w_sup_z_axis > 0 requires batch['gt_rotate']. "
+                "Disable this loss for datasets without GT SQ rotations."
+            )
+
+        pred_rotate = out_dict["rotate"]  # [B, P, 3, 3], local-to-world
+        gt_rotate = batch["gt_rotate"].to(pred_rotate.device).float()
+        K = batch["K"].to(pred_rotate.device).long()
+
+        total = pred_rotate.new_tensor(0.0)
+        total_absdot = 0.0
+        n_pairs = 0
+
+        B = pred_rotate.shape[0]
+        for b in range(B):
+            K_b = int(K[b].item())
+            matched_slots = all_matched_slots[b]
+
+            for k in range(K_b):
+                p = int(matched_slots[k].item())
+                z_pred = pred_rotate[b, p, :, 2]
+                z_gt = gt_rotate[b, k, :, 2]
+
+                z_pred = torch.nn.functional.normalize(z_pred, dim=0)
+                z_gt = torch.nn.functional.normalize(z_gt, dim=0)
+
+                dot = torch.clamp(torch.dot(z_pred, z_gt), -1.0, 1.0)
+                total = total + (1.0 - dot * dot)
+                total_absdot += float(torch.abs(dot).detach().cpu().item())
+                n_pairs += 1
+
+        if n_pairs == 0:
+            z = pred_rotate.new_tensor(0.0)
+            return z, 0.0
+
+        return total / n_pairs, total_absdot / n_pairs
 
     def _compute_shape_param_loss(self, out_dict, batch, all_matched_slots):
         """Direct L1 supervision for SQ shape exponents eps_1, eps_2.
@@ -1009,6 +1376,16 @@ class SupervisedHungarianLoss(nn.Module):
             stage2_surface_loss = assign.new_tensor(0.0)
             stage3_surface_loss = assign.new_tensor(0.0)
 
+        if self.w_z_axis > 0.0:
+            z_axis_loss, z_axis_absdot_mean = self._compute_z_axis_loss(
+                out_dict=out_dict,
+                batch=batch,
+                all_matched_slots=all_matched_slots,
+            )
+        else:
+            z_axis_loss = assign.new_tensor(0.0)
+            z_axis_absdot_mean = 0.0
+
         if self.w_shape_param > 0.0:
             shape_param_loss = self._compute_shape_param_loss(
                 out_dict=out_dict,
@@ -1017,6 +1394,24 @@ class SupervisedHungarianLoss(nn.Module):
             )
         else:
             shape_param_loss = assign.new_tensor(0.0)
+
+        if self.w_highcurv_chamfer_surface > 0.0:
+            highcurv_chamfer_surface_loss = self._compute_highcurv_chamfer_surface_loss(
+                out_dict=out_dict,
+                batch=batch,
+                all_matched_slots=all_matched_slots,
+            )
+        else:
+            highcurv_chamfer_surface_loss = assign.new_tensor(0.0)
+
+        if self.w_highcurv_pointwise_surface > 0.0:
+            highcurv_pointwise_surface_loss = self._compute_highcurv_pointwise_surface_loss(
+                out_dict=out_dict,
+                batch=batch,
+                all_matched_slots=all_matched_slots,
+            )
+        else:
+            highcurv_pointwise_surface_loss = assign.new_tensor(0.0)
 
         if self.w_shape_oracle_surface > 0.0:
             shape_oracle_surface_loss = self._compute_shape_oracle_surface_loss(
@@ -1064,8 +1459,11 @@ class SupervisedHungarianLoss(nn.Module):
             + self.w_stage1_surface * stage1_surface_loss
             + self.w_stage2_surface * stage2_surface_loss
             + self.w_stage3_surface * stage3_surface_loss
+            + self.w_z_axis * z_axis_loss
             + self.w_shape_param * shape_param_loss
             + self.w_shape_oracle_surface * shape_oracle_surface_loss
+            + self.w_highcurv_pointwise_surface * highcurv_pointwise_surface_loss
+            + self.w_highcurv_chamfer_surface * highcurv_chamfer_surface_loss
             + self.w_normal * normal_loss
             + self.w_normal_dir * normal_dir_loss
         )
@@ -1077,9 +1475,17 @@ class SupervisedHungarianLoss(nn.Module):
             "sup_stage1_surface_loss": float(stage1_surface_loss.detach().cpu().item()),
             "sup_stage2_surface_loss": float(stage2_surface_loss.detach().cpu().item()),
             "sup_stage3_surface_loss": float(stage3_surface_loss.detach().cpu().item()),
+            "sup_z_axis_loss": float(z_axis_loss.detach().cpu().item()),
+            "sup_z_axis_absdot_mean": z_axis_absdot_mean,
             "sup_shape_param_loss": float(shape_param_loss.detach().cpu().item()),
             "sup_shape_oracle_surface_loss": float(
                 shape_oracle_surface_loss.detach().cpu().item()
+            ),
+            "sup_highcurv_pointwise_surface_loss": float(
+                highcurv_pointwise_surface_loss.detach().cpu().item()
+            ),
+            "sup_highcurv_chamfer_surface_loss": float(
+                highcurv_chamfer_surface_loss.detach().cpu().item()
             ),
             "sup_normal_loss": float(normal_loss.detach().cpu().item()),
             "sup_normal_dot_mean": normal_stats["sup_normal_dot_mean"],

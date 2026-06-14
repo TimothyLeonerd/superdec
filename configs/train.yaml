@@ -137,10 +137,28 @@ loss:
   # Keep 0.0 for real datasets without GT SQ parameters.
   w_sup_shape_param: 0.0
 
+  # Synthetic-only helper loss:
+  # sign-invariant local z-axis supervision after Hungarian matching:
+  # L = 1 - dot(z_pred, z_gt)^2
+  w_sup_z_axis: 0.0
+
   # Synthetic diagnostic:
   # GT trans/scale/rotate + predicted shape vs full GT SQ surface.
   # Isolates whether eps_1/eps_2 can be learned geometrically.
   w_sup_shape_oracle_surface: 0.0
+
+  # Synthetic diagnostic:
+  # GT-conditioned high-curvature eta/omega sampling + pointwise L2.
+  # Uses GT SQ only to select important sample locations.
+  w_sup_highcurv_pointwise_surface: 0.0
+  w_sup_highcurv_chamfer_surface: 0.0
+  highcurv_n_samples: 128
+  highcurv_eta_bins: 32
+  highcurv_omega_bins: 64
+  highcurv_alpha: 2.0
+  highcurv_uniform_mix: 0.0
+  highcurv_jitter: 1.0
+  highcurv_probe_delta: 0.05
 
   # Part-normal auxiliary loss. Requires sqzero_lmdb.normal_mode=sidecar
   # and <key>.normals LMDB sidecars.
