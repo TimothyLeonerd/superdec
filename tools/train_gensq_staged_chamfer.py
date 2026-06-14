@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+import argparse, csv, itertools, math, random
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+
+PERMS = list(itertools.permutations(range(3)))
+
+
+def set_seed(seed):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def fibonacci_sphere(n, device, dtype=torch.float32):
+    i = torch.arange(n, device=device, dtype=dtype)
+    phi = math.pi * (3.0 - math.sqrt(5.0))
+    y = 1.0 - 2.0 * (i + 0.5) / n
+    r = torch.sqrt(torch.clamp(1.0 - y * y, min=0.0))
+    theta = phi * i
+    x = torch.cos(theta) * r
+    z = torch.sin(theta) * r
+    return torch.stack([x, y, z], dim=-1)
+
+
+def random_rotations(batch, device):
+    q = torch.randn(batch, 4, device=device)
+    q = F.normalize(q, dim=-1)
+    w, x, y, z = q.unbind(-1)
+
+    R = torch.empty(batch, 3, 3, device=device)
+    R[:, 0, 0] = 1 - 2 * (y*y + z*z)
+    R[:, 0, 1] = 2 * (x*y - z*w)
+    R[:, 0, 2] = 2 * (x*z + y*w)
+    R[:, 1, 0] = 2 * (x*y + z*w)
+    R[:, 1, 1] = 1 - 2 * (x*x + z*z)
+    R[:, 1, 2] = 2 * (y*z - x*w)
+    R[:, 2, 0] = 2 * (x*z - y*w)
+    R[:, 2, 1] = 2 * (y*z + x*w)
+    R[:, 2, 2] = 1 - 2 * (x*x + y*y)
+    return R
+
+
+def bounded(raw, lo, hi):
+    return lo + (hi - lo) * torch.sigmoid(raw)
+
+
+def sample_generalized_surface(scale, exp, dirs, newton_iters=12):
+    # |x/A|^r + |y/B|^s + |z/C|^t = 1
+    B = scale.shape[0]
+    S = dirs.shape[0]
+
+    u = dirs[None].expand(B, S, 3)
+    A = scale[:, None, :].clamp_min(1e-6)
+    e = exp[:, None, :].clamp_min(0.05)
+
+    coeff = (u.abs().clamp_min(1e-8) / A).pow(e)
+
+    em = e.mean(dim=-1, keepdim=True)
+    rho = coeff.sum(dim=-1, keepdim=True).clamp_min(1e-8).pow(-1.0 / em).clamp(1e-4, 10.0)
+
+    for _ in range(newton_iters):
+        f = (coeff * rho.pow(e)).sum(dim=-1, keepdim=True) - 1.0
+        df = (coeff * e * rho.pow(e - 1.0)).sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        rho = (rho - f / df).clamp(1e-4, 10.0)
+
+    return u * rho
+
+
+def chamfer(a, b):
+    d2 = torch.cdist(a, b).pow(2)
+    return d2.min(dim=2).values.mean(dim=1) + d2.min(dim=1).values.mean(dim=1)
+
+
+@torch.no_grad()
+def make_dataset(n, points, scale_min, scale_max, exp_min, exp_max, device, chunk=2048):
+    dirs = fibonacci_sphere(points, device)
+    all_world, all_R, all_scale, all_exp = [], [], [], []
+
+    for start in range(0, n, chunk):
+        b = min(chunk, n - start)
+
+        scale = scale_min + (scale_max - scale_min) * torch.rand(b, 3, device=device)
+        exp = exp_min + (exp_max - exp_min) * torch.rand(b, 3, device=device)
+        R = random_rotations(b, device)
+
+        local = sample_generalized_surface(scale, exp, dirs)
+        world = local @ R.transpose(1, 2)
+
+        all_world.append(world.cpu())
+        all_R.append(R.cpu())
+        all_scale.append(scale.cpu())
+        all_exp.append(exp.cpu())
+
+    return (
+        torch.cat(all_world, 0),
+        torch.cat(all_R, 0),
+        torch.cat(all_scale, 0),
+        torch.cat(all_exp, 0),
+    )
+
+
+class PointNetEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.point = nn.Sequential(
+            nn.Linear(3, 128), nn.ReLU(),
+            nn.Linear(128, 256), nn.ReLU(),
+            nn.Linear(256, 512), nn.ReLU(),
+        )
+        self.trunk = nn.Sequential(
+            nn.Linear(1024, 512), nn.ReLU(),
+            nn.Linear(512, 256), nn.ReLU(),
+        )
+
+    def forward(self, x):
+        h = self.point(x)
+        pooled = torch.cat([h.max(dim=1).values, h.mean(dim=1)], dim=-1)
+        return self.trunk(pooled)
+
+
+class FrameNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.enc = PointNetEncoder()
+        self.frame_head = nn.Linear(256, 9)
+
+    def forward(self, x):
+        z = self.enc(x)
+        M = self.frame_head(z).reshape(-1, 3, 3)
+
+        U, _S, Vh = torch.linalg.svd(M)
+        R = U @ Vh
+        det = torch.det(R)
+
+        D = torch.eye(3, device=x.device, dtype=x.dtype).expand(x.shape[0], 3, 3).clone()
+        D[:, 2, 2] = torch.where(det < 0, -1.0, 1.0)
+
+        return U @ D @ Vh
+
+
+class ShapeNet(nn.Module):
+    def __init__(self, scale_min, scale_max, exp_min, exp_max):
+        super().__init__()
+        self.scale_min = scale_min
+        self.scale_max = scale_max
+        self.exp_min = exp_min
+        self.exp_max = exp_max
+
+        self.enc = PointNetEncoder()
+        self.scale_head = nn.Linear(256, 3)
+        self.exp_head = nn.Linear(256, 3)
+
+    def forward(self, x):
+        z = self.enc(x)
+        scale = bounded(self.scale_head(z), self.scale_min, self.scale_max)
+        exp = bounded(self.exp_head(z), self.exp_min, self.exp_max)
+        return scale, exp
+
+
+class StagedModel(nn.Module):
+    def __init__(self, scale_min, scale_max, exp_min, exp_max):
+        super().__init__()
+        self.frame_net = FrameNet()
+        self.shape_net = ShapeNet(scale_min, scale_max, exp_min, exp_max)
+
+    def forward(self, world):
+        R = self.frame_net(world)
+        local_pred = world @ R
+        scale, exp = self.shape_net(local_pred)
+        return R, scale, exp
+
+
+def frame_perm_metrics(pred_R, gt_R):
+    losses, angles = [], []
+
+    for p in PERMS:
+        gt = gt_R[:, :, list(p)]
+        dot = (pred_R * gt).sum(dim=1).abs().clamp(0, 1)  # column-wise
+        loss = (1.0 - dot.pow(2)).mean(dim=1)
+        angle = torch.acos(dot) * (180.0 / math.pi)
+
+        losses.append(loss)
+        angles.append(angle)
+
+    losses = torch.stack(losses, dim=1)  # [B,6]
+    angles = torch.stack(angles, dim=1)  # [B,6,3]
+
+    best_idx = losses.argmin(dim=1)
+    best_loss = losses.gather(1, best_idx[:, None]).squeeze(1)
+    best_angles = angles.gather(1, best_idx[:, None, None].expand(-1, 1, 3)).squeeze(1)
+
+    return best_loss, best_idx, best_angles
+
+
+def gather_perm_params(gt_scale, gt_exp, best_idx):
+    perms = torch.tensor(PERMS, device=gt_scale.device, dtype=torch.long)
+    idx = perms[best_idx]
+    return gt_scale.gather(1, idx), gt_exp.gather(1, idx)
+
+
+@torch.no_grad()
+def evaluate(model, loader, dirs, args, device):
+    model.eval()
+
+    cd_all, angle_all, scale_all, exp_all, frame_loss_all = [], [], [], [], []
+
+    for world, gt_R, gt_scale, gt_exp in loader:
+        world = world.to(device)
+        gt_R = gt_R.to(device)
+        gt_scale = gt_scale.to(device)
+        gt_exp = gt_exp.to(device)
+
+        pred_R, pred_scale, pred_exp = model(world)
+
+        pred_local_surf = sample_generalized_surface(pred_scale, pred_exp, dirs)
+        pred_world = pred_local_surf @ pred_R.transpose(1, 2)
+        cd = chamfer(pred_world, world)
+
+        frame_loss, best_idx, best_angles = frame_perm_metrics(pred_R, gt_R)
+        gt_scale_p, gt_exp_p = gather_perm_params(gt_scale, gt_exp, best_idx)
+
+        scale_l1 = (pred_scale - gt_scale_p).abs().mean(dim=1)
+        exp_l1 = (pred_exp - gt_exp_p).abs().mean(dim=1)
+
+        cd_all.append(cd.cpu())
+        angle_all.append(best_angles.reshape(-1).cpu())
+        scale_all.append(scale_l1.cpu())
+        exp_all.append(exp_l1.cpu())
+        frame_loss_all.append(frame_loss.cpu())
+
+    cd = torch.cat(cd_all)
+    angle = torch.cat(angle_all)
+    scale = torch.cat(scale_all)
+    exp = torch.cat(exp_all)
+    frame_loss = torch.cat(frame_loss_all)
+
+    return {
+        "cd_mean": float(cd.mean()),
+        "cd_p95": float(torch.quantile(cd, 0.95)),
+        "frame_axis_angle_mean": float(angle.mean()),
+        "frame_axis_angle_p95": float(torch.quantile(angle, 0.95)),
+        "frame_loss_mean": float(frame_loss.mean()),
+        "scale_l1_mean": float(scale.mean()),
+        "scale_l1_p95": float(torch.quantile(scale, 0.95)),
+        "exp_l1_mean": float(exp.mean()),
+        "exp_l1_p95": float(torch.quantile(exp, 0.95)),
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--train-n", type=int, default=10000)
+    ap.add_argument("--val-n", type=int, default=1000)
+    ap.add_argument("--points", type=int, default=512)
+    ap.add_argument("--epochs", type=int, default=50)
+    ap.add_argument("--batch-size", type=int, default=128)
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--scale-min", type=float, default=0.08)
+    ap.add_argument("--scale-max", type=float, default=0.35)
+    ap.add_argument("--exp-min", type=float, default=1.0)
+    ap.add_argument("--exp-max", type=float, default=8.0)
+    ap.add_argument("--w-frame", type=float, default=0.0)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--device", default="cuda")
+    args = ap.parse_args()
+
+    set_seed(args.seed)
+
+    out = Path(args.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    dirs = fibonacci_sphere(args.points, device)
+
+    print("Generating train data...", flush=True)
+    train = make_dataset(args.train_n, args.points, args.scale_min, args.scale_max, args.exp_min, args.exp_max, device)
+
+    print("Generating val data...", flush=True)
+    val = make_dataset(args.val_n, args.points, args.scale_min, args.scale_max, args.exp_min, args.exp_max, device)
+
+    train_loader = DataLoader(TensorDataset(*train), batch_size=args.batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(TensorDataset(*val), batch_size=args.batch_size, shuffle=False, num_workers=0)
+
+    model = StagedModel(args.scale_min, args.scale_max, args.exp_min, args.exp_max).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+
+    fields = [
+        "epoch", "train_loss", "train_cd",
+        "val_cd_mean", "val_cd_p95",
+        "val_frame_axis_angle_mean", "val_frame_axis_angle_p95", "val_frame_loss_mean",
+        "val_scale_l1_mean", "val_scale_l1_p95",
+        "val_exp_l1_mean", "val_exp_l1_p95",
+    ]
+
+    best_cd = 1e9
+
+    with open(out / "metrics.csv", "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+
+        for ep in range(1, args.epochs + 1):
+            model.train()
+            total_loss, total_cd, seen = 0.0, 0.0, 0
+
+            for world, gt_R, _gt_scale, _gt_exp in train_loader:
+                world = world.to(device)
+                gt_R = gt_R.to(device)
+
+                pred_R, pred_scale, pred_exp = model(world)
+
+                pred_local_surf = sample_generalized_surface(pred_scale, pred_exp, dirs)
+                pred_world = pred_local_surf @ pred_R.transpose(1, 2)
+                cd = chamfer(pred_world, world)
+
+                loss = cd.mean()
+
+                if args.w_frame > 0:
+                    frame_loss, _best_idx, _angles = frame_perm_metrics(pred_R, gt_R)
+                    loss = loss + args.w_frame * frame_loss.mean()
+
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                opt.step()
+
+                total_loss += loss.item() * world.shape[0]
+                total_cd += cd.mean().item() * world.shape[0]
+                seen += world.shape[0]
+
+            va = evaluate(model, val_loader, dirs, args, device)
+
+            row = {
+                "epoch": ep,
+                "train_loss": total_loss / max(seen, 1),
+                "train_cd": total_cd / max(seen, 1),
+                "val_cd_mean": va["cd_mean"],
+                "val_cd_p95": va["cd_p95"],
+                "val_frame_axis_angle_mean": va["frame_axis_angle_mean"],
+                "val_frame_axis_angle_p95": va["frame_axis_angle_p95"],
+                "val_frame_loss_mean": va["frame_loss_mean"],
+                "val_scale_l1_mean": va["scale_l1_mean"],
+                "val_scale_l1_p95": va["scale_l1_p95"],
+                "val_exp_l1_mean": va["exp_l1_mean"],
+                "val_exp_l1_p95": va["exp_l1_p95"],
+            }
+            writer.writerow(row)
+            f.flush()
+
+            if va["cd_mean"] < best_cd:
+                best_cd = va["cd_mean"]
+                torch.save({"model": model.state_dict(), "args": vars(args), "epoch": ep, "val": va}, out / "best.pt")
+
+            print(
+                f"Epoch {ep:03d}/{args.epochs} "
+                f"cd={va['cd_mean']:.7g}/{va['cd_p95']:.7g} "
+                f"axis={va['frame_axis_angle_mean']:.2f}/{va['frame_axis_angle_p95']:.2f} "
+                f"scale={va['scale_l1_mean']:.4f} "
+                f"exp={va['exp_l1_mean']:.4f}",
+                flush=True,
+            )
+
+    print("OUT", out)
+    print(open(out / "metrics.csv").read().splitlines()[-1])
+
+
+if __name__ == "__main__":
+    main()

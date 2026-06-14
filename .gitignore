@@ -16,3 +16,7 @@ build*
 tmp*
 *.pt
 checkpoints*
+# local scratch / backups
+_handoff_snapshot/
+*.bak
+*_tmp.py
