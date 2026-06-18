@@ -65,30 +65,51 @@ def inv_sigmoid_param(x, lo, hi):
     return torch.log(y / (1 - y))
 
 
-def sample_generalized_surface(scale, exp, dirs, newton_iters=12):
-    # scale [B,3], exp [B,3], dirs [S,3], returns [B,S,3]
+def sample_generalized_surface(scale, exp, dirs, newton_iters=32):
+    """
+    Robust radial sampler for the generalized superquadric surface
+
+        |x/A|^r + |y/B|^s + |z/C|^t = 1
+
+    along directions `dirs`.
+
+    `newton_iters` is kept for API compatibility, but is now used as the
+    number of bracketed bisection iterations. This avoids Newton overshoot
+    for large exponents / small scales and guarantees |x_i| <= scale_i.
+    """
     B = scale.shape[0]
     S = dirs.shape[0]
 
-    u = dirs[None].expand(B, S, 3)
-    A = scale[:, None, :].clamp_min(1e-6)
+    dtype = scale.dtype
+    device = scale.device
+
+    u = dirs.to(device=device, dtype=dtype)[None].expand(B, S, 3)
+    A = scale[:, None, :].clamp_min(1e-8)
     e = exp[:, None, :].clamp_min(0.05)
 
-    coeff = (u.abs().clamp_min(1e-8) / A).pow(e)
+    abs_u = u.abs()
 
-    # decent init: use equal-exponent approximation with mean exponent
-    em = e.mean(dim=-1, keepdim=True)
-    rho = coeff.sum(dim=-1, keepdim=True).clamp_min(1e-8).pow(-1.0 / em).clamp(1e-4, 10.0)
+    # For x = rho * u, coordinate validity requires
+    # rho <= A_i / |u_i| for every nonzero direction component.
+    # Thus the true root is bracketed in [0, min_i A_i/|u_i|].
+    huge = torch.full_like(abs_u, 1e8)
+    rho_axis_hi = torch.where(abs_u > 1e-12, A / abs_u.clamp_min(1e-12), huge)
+    rho_hi = rho_axis_hi.min(dim=-1, keepdim=True).values.clamp_min(1e-12)
+    rho_lo = torch.zeros_like(rho_hi)
 
-    for _ in range(newton_iters):
-        rho_e = rho.pow(e)
-        f = (coeff * rho_e).sum(dim=-1, keepdim=True) - 1.0
-        df = (coeff * e * rho.pow(e - 1.0)).sum(dim=-1, keepdim=True).clamp_min(1e-8)
-        rho = (rho - f / df).clamp(1e-4, 10.0)
+    coeff = (abs_u.clamp_min(1e-12) / A).pow(e)
 
+    for _ in range(int(newton_iters)):
+        rho_mid = 0.5 * (rho_lo + rho_hi)
+        f_mid = (coeff * rho_mid.clamp_min(1e-12).pow(e)).sum(dim=-1, keepdim=True) - 1.0
+
+        # f(rho) is monotone increasing. Keep the root bracketed.
+        too_high = f_mid >= 0.0
+        rho_hi = torch.where(too_high, rho_mid, rho_hi)
+        rho_lo = torch.where(too_high, rho_lo, rho_mid)
+
+    rho = 0.5 * (rho_lo + rho_hi)
     return u * rho
-
-
 def chamfer(a, b):
     d2 = torch.cdist(a, b).pow(2)
     return d2.min(dim=2).values.mean(dim=1) + d2.min(dim=1).values.mean(dim=1)
