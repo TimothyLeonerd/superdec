@@ -31,15 +31,19 @@ def bounded(raw, lo, hi):
 
 def sample_generalized_surface(scale, exp, dirs, newton_iters=32):
     """
-    Robust radial sampler for the generalized superquadric surface
+    Robust differentiable radial sampler for
 
         |x/A|^r + |y/B|^s + |z/C|^t = 1
 
     along directions `dirs`.
 
-    `newton_iters` is kept for API compatibility, but is now used as the
-    number of bracketed bisection iterations. This avoids Newton overshoot
-    for large exponents / small scales and guarantees |x_i| <= scale_i.
+    Forward pass:
+        bracketed bisection guarantees bounded valid samples.
+
+    Backward pass:
+        after bisection, apply one implicit Newton correction from the
+        detached root. This gives gradients w.r.t. scale and exponents
+        without allowing Newton overshoot in the forward pass.
     """
     B = scale.shape[0]
     S = dirs.shape[0]
@@ -51,28 +55,44 @@ def sample_generalized_surface(scale, exp, dirs, newton_iters=32):
     A = scale[:, None, :].clamp_min(1e-8)
     e = exp[:, None, :].clamp_min(0.05)
 
-    abs_u = u.abs()
+    abs_u = u.abs().clamp_min(1e-12)
 
-    # For x = rho * u, coordinate validity requires
-    # rho <= A_i / |u_i| for every nonzero direction component.
-    # Thus the true root is bracketed in [0, min_i A_i/|u_i|].
-    huge = torch.full_like(abs_u, 1e8)
-    rho_axis_hi = torch.where(abs_u > 1e-12, A / abs_u.clamp_min(1e-12), huge)
-    rho_hi = rho_axis_hi.min(dim=-1, keepdim=True).values.clamp_min(1e-12)
-    rho_lo = torch.zeros_like(rho_hi)
+    # Coordinate validity requires rho <= A_i / |u_i|.
+    rho_axis_hi = A / abs_u
+    rho_hi_bound = rho_axis_hi.min(dim=-1, keepdim=True).values.clamp_min(1e-12)
 
-    coeff = (abs_u.clamp_min(1e-12) / A).pow(e)
+    coeff = (abs_u / A).pow(e)
+
+    # Safe forward root by bisection. The branch decisions are intentionally
+    # treated as numerical root-finding, not as the gradient path.
+    rho_lo = torch.zeros_like(rho_hi_bound)
+    rho_hi = rho_hi_bound
 
     for _ in range(int(newton_iters)):
         rho_mid = 0.5 * (rho_lo + rho_hi)
         f_mid = (coeff * rho_mid.clamp_min(1e-12).pow(e)).sum(dim=-1, keepdim=True) - 1.0
-
-        # f(rho) is monotone increasing. Keep the root bracketed.
         too_high = f_mid >= 0.0
         rho_hi = torch.where(too_high, rho_mid, rho_hi)
         rho_lo = torch.where(too_high, rho_lo, rho_mid)
 
-    rho = 0.5 * (rho_lo + rho_hi)
+    rho_root = (0.5 * (rho_lo + rho_hi)).detach().clamp_min(1e-12)
+
+    # Differentiable implicit correction:
+    # F(rho, A, e) = sum_i (|u_i|/A_i)^e_i * rho^e_i - 1 = 0
+    # rho = rho_root - F / dF_drho
+    # At an accurate root this changes the forward value negligibly but
+    # provides the correct local implicit gradient.
+    rho_pow = rho_root.pow(e)
+    F = (coeff * rho_pow).sum(dim=-1, keepdim=True) - 1.0
+    dF = (coeff * e * rho_root.pow(e - 1.0)).sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+    rho = rho_root - F / dF
+
+    # Safety: bisection already gives an in-bounds root; this clamp should
+    # almost never activate, but prevents numerical nonsense.
+    rho = rho.clamp_min(1e-12)
+    rho = torch.minimum(rho, rho_hi_bound)
+
     return u * rho
 @torch.no_grad()
 def make_dataset(n, points, scale_min, scale_max, exp_min, exp_max, device, chunk=2048):
